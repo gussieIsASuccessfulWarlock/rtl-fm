@@ -1,0 +1,2 @@
+# Allow members of the "audio" group to access the RTL2838 directly.
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", MODE="0660", GROUP="audio"

@@ -1,0 +1,35 @@
+[package]
+name = "rtl-fm"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rtl-fm"
+path = "src/main.rs"
+
+[dependencies]
+nusb = "0.1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+futures-util = "0.3"
+bytes = "1"
+num-complex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+flacenc = "0.4"
+parking_lot = "0.12"
+rand = { version = "0.8", features = ["small_rng"] }
+rustfft = "6"
+async-stream = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
