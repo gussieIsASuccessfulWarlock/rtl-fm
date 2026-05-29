@@ -113,6 +113,17 @@ impl NrscDecoder {
             self.framer.feed(&resampled);
 
             while self.framer.process_one_symbol() {
+                if self.framer.symbols_seen().is_multiple_of(1024) {
+                    debug!(
+                        "NRSC-5 acquisition: symbols={} cp_metric={:.3} cfo={:.1}Hz timing={} cp_locked={} frame_aligned={}",
+                        self.framer.symbols_seen(),
+                        self.framer.acquisition().cp_metric,
+                        self.framer.acquisition().coarse_cfo_hz,
+                        self.framer.acquisition().timing_offset,
+                        self.framer.acquisition().locked,
+                        self.framer.sync.frame_aligned,
+                    );
+                }
                 if !self.framer.sync.frame_aligned {
                     continue;
                 }

@@ -150,7 +150,10 @@ async fn main() -> anyhow::Result<()> {
 async fn run_idle_refresher(channelizer: std::sync::Arc<Channelizer>) {
     use std::time::Duration;
 
-    const STATION_DWELL: Duration = Duration::from_secs(4);
+    // HD Radio needs enough dwell to acquire OFDM timing, frame sync,
+    // FEC, and AAS/LOT metadata. Four seconds is enough for RDS PS/RT
+    // refreshes but routinely aborts NRSC-5 before it can prove lock.
+    const STATION_DWELL: Duration = Duration::from_secs(30);
     const IDLE_PAUSE: Duration = Duration::from_millis(750);
     const BUSY_PAUSE: Duration = Duration::from_secs(2);
 
