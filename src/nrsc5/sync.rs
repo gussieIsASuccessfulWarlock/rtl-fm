@@ -1,0 +1,88 @@
+//! Time/frequency synchronization and reference subcarrier processing.
+
+use num_complex::Complex;
+
+use crate::nrsc5::consts::{
+    FRAME_SYMBOLS, NUM_REF, REF_PATTERN, REF_SUBCARRIERS, bin_idx,
+};
+
+pub struct Sync {
+    frame_count: u64,
+    pub frame_aligned: bool,
+    pub channel_estimates: Vec<Complex<f32>>,
+    ref_buf: Vec<Complex<f32>>,
+    symbol_count: u64,
+}
+
+impl Sync {
+    pub fn new() -> Self {
+        Self {
+            frame_count: 0,
+            frame_aligned: false,
+            channel_estimates: vec![Complex::new(0.0, 0.0); NUM_REF],
+            ref_buf: Vec::with_capacity(FRAME_SYMBOLS * NUM_REF),
+            symbol_count: 0,
+        }
+    }
+
+    pub fn process_symbol(&mut self, fft_bins: &[Complex<f32>]) {
+        self.symbol_count += 1;
+        let _sym_idx = (self.symbol_count - 1) % FRAME_SYMBOLS as u64;
+        let pat = &REF_PATTERN;
+
+        let ref_vals: Vec<Complex<f32>> = REF_SUBCARRIERS.iter().take(NUM_REF).map(|&sc| {
+            let idx = bin_idx(sc);
+            fft_bins[idx]
+        }).collect();
+
+        if !self.frame_aligned {
+            self.ref_buf.extend(ref_vals);
+            if self.ref_buf.len() >= NUM_REF * FRAME_SYMBOLS {
+                self.detect_frame(pat);
+            }
+            return;
+        }
+
+        for (ri, (rv, ce)) in ref_vals.iter().zip(self.channel_estimates.iter_mut()).enumerate() {
+            let pat_idx = (self.frame_count % FRAME_SYMBOLS as u64) * NUM_REF as u64 + ri as u64;
+            let sign = pat[pat_idx as usize];
+            *ce = if sign > 0 { *rv } else { -*rv };
+        }
+
+        self.frame_count += 1;
+    }
+
+    fn detect_frame(&mut self, pat: &[i8]) {
+        let mut best_corr = -1.0f32;
+        let mut best_off = 0usize;
+        for off in 0..FRAME_SYMBOLS {
+            let mut corr = 0.0f32;
+            for sym in 0..FRAME_SYMBOLS {
+                for ri in 0..NUM_REF {
+                    let val = self.ref_buf[sym * NUM_REF + ri];
+                    let pat_idx = ((sym + off) % FRAME_SYMBOLS) * NUM_REF + ri;
+                    let sign = pat[pat_idx];
+                    corr += if sign > 0 { val.re } else { -val.re };
+                }
+            }
+            if corr > best_corr {
+                best_corr = corr;
+                best_off = off;
+            }
+        }
+        let threshold = (NUM_REF * FRAME_SYMBOLS) as f32 * 0.3;
+        if best_corr > threshold {
+            self.frame_aligned = true;
+            self.frame_count = 0;
+            let drop = best_off * NUM_REF;
+            if drop <= self.ref_buf.len() {
+                self.ref_buf.drain(..drop);
+            }
+        }
+        self.ref_buf.clear();
+    }
+}
+
+impl Default for Sync {
+    fn default() -> Self { Self::new() }
+}
