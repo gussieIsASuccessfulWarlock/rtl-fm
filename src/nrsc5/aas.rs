@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::channelizer::metadata::RdsMetadataDto;
+use crate::channelizer::metadata::{HdMetadataDto, RdsMetadataDto};
 
 /// Parsed AAS packet.
 #[derive(Debug, Clone)]
@@ -209,8 +209,23 @@ impl AasDecoder {
             music: true,
             groups_decoded: 0,
             blocks_dropped: 0,
+            hd: Some(self.to_hd_metadata()).filter(|hd| hd.has_data()),
             last_update_unix: None,
             first_decoded_at_unix: None,
+        }
+    }
+
+    pub fn to_hd_metadata(&self) -> HdMetadataDto {
+        HdMetadataDto {
+            title: self.psd.title.clone(),
+            artist: self.psd.artist.clone(),
+            album: self.psd.album.clone(),
+            genre: self.psd.genre.clone(),
+            station_name: self.sig.station_name.clone(),
+            slogan: self.sig.slogan.clone(),
+            album_art_mime: None,
+            album_art_len: None,
+            album_art_updated_unix: None,
         }
     }
 }

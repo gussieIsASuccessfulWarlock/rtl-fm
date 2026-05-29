@@ -121,14 +121,14 @@ impl NrscDecoder {
                         }
                         if !aas.completed_objects.is_empty() {
                             for obj in aas.completed_objects.drain(..) {
-                                let mime: Option<&str> = if obj.data.len() > 4
+                                let mime: Option<String> = if obj.data.len() > 4
                                     && obj.data[0] == 0xFF && obj.data[1] == 0xD8
                                 {
-                                    Some("image/jpeg")
+                                    Some("image/jpeg".to_string())
                                 } else if obj.data.len() > 8
                                     && &obj.data[0..8] == b"\x89PNG\r\n\x1a\n"
                                 {
-                                    Some("image/png")
+                                    Some("image/png".to_string())
                                 } else {
                                     None
                                 };
@@ -136,12 +136,14 @@ impl NrscDecoder {
                                     "NRSC-5 LOT complete: {} bytes, mime={:?}, lot_id={}",
                                     obj.data.len(), mime, obj.lot_id
                                 );
+                                self.metadata.update_hd_album_art(mime, obj.data);
                             }
                         }
                     }
 
                     if frames_processed.is_multiple_of(54) {
                         let dto = aas.to_metadata_dto();
+                        self.metadata.update_hd(aas.to_hd_metadata());
                         let rds_meta = crate::dsp::rds_decoder::RdsMetadata {
                             pi: None,
                             callsign: dto.callsign,

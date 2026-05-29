@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/metadata", get(metadata::all))
         .route("/api/metadata/:khz", get(metadata::one))
         .route("/api/metadata/:khz/stream", get(metadata::one_sse))
+        .route("/api/albumart/:khz", get(metadata::album_art))
         .route("/api/stations", get(metadata::stations))
         .route("/api/stations/stream", get(metadata::stations_sse))
         .route("/stream/:file", get(stream::audio))

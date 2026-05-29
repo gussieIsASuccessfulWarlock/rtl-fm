@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::Stream;
 use serde::Serialize;
@@ -93,6 +94,26 @@ pub async fn one_sse(
         }
     };
     Ok(Sse::new(s).keep_alive(KeepAlive::default()))
+}
+
+pub async fn album_art(
+    Path(khz): Path<String>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let Some(freq_hz) = parse_freq_hz(&khz) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid frequency".to_string()));
+    };
+    let Some(art) = state.channelizer.album_art(freq_hz) else {
+        return Err((StatusCode::NOT_FOUND, "no HD album art cached".to_string()));
+    };
+    let mut headers = HeaderMap::new();
+    let mime = art.mime.as_deref().unwrap_or("application/octet-stream");
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(mime).unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((headers, art.bytes))
 }
 
 /// All-stations snapshot used by the home page when nothing is

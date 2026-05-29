@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use metadata::{RdsMetadataDto, StationMetadata};
+pub use metadata::{HdAlbumArt, RdsMetadataDto, StationMetadata};
 
 use num_complex::Complex;
 use parking_lot::Mutex;
@@ -134,6 +134,10 @@ impl Channelizer {
 
     pub fn metadata_snapshot(&self, freq_hz: u32) -> Option<RdsMetadataDto> {
         self.metadata.lock().get(&freq_hz).map(|m| m.snapshot())
+    }
+
+    pub fn album_art(&self, freq_hz: u32) -> Option<HdAlbumArt> {
+        self.metadata.lock().get(&freq_hz).and_then(|m| m.album_art())
     }
 
     pub fn all_metadata_snapshots(&self) -> HashMap<u32, RdsMetadataDto> {
