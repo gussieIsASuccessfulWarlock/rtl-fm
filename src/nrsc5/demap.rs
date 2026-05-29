@@ -8,13 +8,10 @@ use crate::nrsc5::consts::{OFDM_FFT_LEN, REF_SUBCARRIERS};
 
 /// Soft demap QPSK symbol to two 8-bit LLRs (0..255, 128 = erasure).
 pub fn soft_demap_qpsk(z: Complex<f32>) -> (u8, u8) {
-    let s2 = std::f32::consts::SQRT_2;
-    let inv_s2 = 0.70710677f32;
-    let d_i = (z.re.abs() - inv_s2).abs();
-    let d_q = (z.im.abs() - inv_s2).abs();
-    let llr_i = 255.0 * (1.0 - d_i / s2);
-    let llr_q = 255.0 * (1.0 - d_q / s2);
-    (llr_i.clamp(0.0, 255.0) as u8, llr_q.clamp(0.0, 255.0) as u8)
+    let scale = 90.0f32;
+    let i = 127.5 + z.re * scale;
+    let q = 127.5 + z.im * scale;
+    (i.clamp(0.0, 255.0) as u8, q.clamp(0.0, 255.0) as u8)
 }
 
 /// All P1 data subcarrier indices (signed, 0-centered) for FM Hybrid mode.

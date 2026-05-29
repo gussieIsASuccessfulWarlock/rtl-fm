@@ -123,6 +123,10 @@ fn chien_search(locator: &[u8; RS_PARITY + 1]) -> Vec<usize> {
     errors
 }
 
+fn locator_degree(locator: &[u8; RS_PARITY + 1]) -> usize {
+    locator.iter().rposition(|&c| c != 0).unwrap_or(0)
+}
+
 /// Forney algorithm: compute error values at the error positions.
 fn forney(syn: &[u8; RS_PARITY], error_pos: &[usize]) -> Vec<u8> {
     let mut values = Vec::with_capacity(error_pos.len());
@@ -155,8 +159,12 @@ pub fn decode_rs(data: &mut [u8]) -> Result<&[u8], ()> {
     }
 
     let locator = berlekamp_massey(&syn);
+    let degree = locator_degree(&locator);
+    if degree == 0 || degree > RS_PARITY / 2 {
+        return Err(());
+    }
     let error_pos = chien_search(&locator);
-    if error_pos.is_empty() {
+    if error_pos.len() != degree || error_pos.len() > RS_PARITY / 2 {
         return Err(());
     }
 
@@ -198,4 +206,24 @@ pub fn decode_blocks(blocks: &mut [Vec<u8>]) -> Result<Vec<u8>, ()> {
         result.extend_from_slice(decoded);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_arbitrary_codeword() {
+        let mut data = [0u8; RS_N];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(37).wrapping_add(11) & 0xff) as u8;
+        }
+        assert!(decode_rs(&mut data).is_err());
+    }
+
+    #[test]
+    fn accepts_zero_codeword() {
+        let mut data = [0u8; RS_N];
+        assert!(decode_rs(&mut data).is_ok());
+    }
 }

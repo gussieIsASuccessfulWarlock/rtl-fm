@@ -95,6 +95,7 @@ impl NrscDecoder {
         let mut pdus: Vec<frame::P1Pdu> = Vec::new();
 
         let mut frames_processed: u64 = 0;
+        let mut chunks_seen: u64 = 0;
 
         loop {
             let chunk = match self.iq_rx.recv().await {
@@ -104,6 +105,7 @@ impl NrscDecoder {
             };
 
             crate::dsp::u8_iq_to_complex(&chunk, &mut iq_complex);
+            chunks_seen += 1;
             mixed.clear();
             for &z in &iq_complex {
                 mixed.push(z * nco.step());
@@ -111,17 +113,30 @@ impl NrscDecoder {
             resampled.clear();
             self.resamp.process(&mixed, &mut resampled);
             self.framer.feed(&resampled);
+            if chunks_seen.is_multiple_of(256) && !self.framer.sync.frame_aligned {
+                debug!(
+                    "NRSC-5 acquisition pending: chunks={} symbols={} cp_metric={:.3} cfo={:.1}Hz timing={} cp_locked={}",
+                    chunks_seen,
+                    self.framer.symbols_seen(),
+                    self.framer.acquisition().cp_metric,
+                    self.framer.acquisition().coarse_cfo_hz,
+                    self.framer.acquisition().timing_offset,
+                    self.framer.acquisition().locked,
+                );
+            }
 
             while self.framer.process_one_symbol() {
                 if self.framer.symbols_seen().is_multiple_of(1024) {
                     debug!(
-                        "NRSC-5 acquisition: symbols={} cp_metric={:.3} cfo={:.1}Hz timing={} cp_locked={} frame_aligned={}",
+                        "NRSC-5 acquisition: symbols={} cp_metric={:.3} cfo={:.1}Hz timing={} cp_locked={} frame_aligned={} frame_metric={:.3} frame_offset={}",
                         self.framer.symbols_seen(),
                         self.framer.acquisition().cp_metric,
                         self.framer.acquisition().coarse_cfo_hz,
                         self.framer.acquisition().timing_offset,
                         self.framer.acquisition().locked,
                         self.framer.sync.frame_aligned,
+                        self.framer.sync.frame_metric,
+                        self.framer.sync.frame_offset,
                     );
                 }
                 if !self.framer.sync.frame_aligned {
@@ -145,8 +160,10 @@ impl NrscDecoder {
                     pdus.clear();
                     frame_dec.process_frame(decoded, &mut pdus);
                     if frames_processed.is_multiple_of(20) {
+                        let decoded_nonzero = decoded.iter().filter(|&&b| b != 0).count();
+                        let decoded_ones: u32 = decoded.iter().map(|b| b.count_ones()).sum();
                         debug!(
-                            "NRSC-5 stats: symbols={} cp_metric={:.3} cfo={:.1}Hz timing={} cp_locked={} frame_aligned={} soft_bits={} pdus={} lot_ready={}",
+                            "NRSC-5 stats: symbols={} cp_metric={:.3} cfo={:.1}Hz timing={} cp_locked={} frame_aligned={} decoded_bytes={} nonzero={} ones={} rs_ok={} rs_fail={} crc_ok={} crc_fail={} pdus={} lot_ready={}",
                             self.framer.symbols_seen(),
                             self.framer.acquisition().cp_metric,
                             self.framer.acquisition().coarse_cfo_hz,
@@ -154,6 +171,12 @@ impl NrscDecoder {
                             self.framer.acquisition().locked,
                             self.framer.sync.frame_aligned,
                             decoded.len(),
+                            decoded_nonzero,
+                            decoded_ones,
+                            frame_dec.stats().rs_ok,
+                            frame_dec.stats().rs_fail,
+                            frame_dec.stats().pdu_crc_ok,
+                            frame_dec.stats().pdu_crc_fail,
                             pdus.len(),
                             aas.completed_objects.len(),
                         );

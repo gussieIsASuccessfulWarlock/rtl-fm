@@ -26,26 +26,13 @@ static OUTPUT_TABLE: LazyLock<[[u8; VITERBI_INPUTS]; VITERBI_NUMS]> = LazyLock::
             | ((shift_reg >> 5) ^ (shift_reg >> 2) ^ shift_reg) & 1;
     }
 
-    // Generate gen5 table: 8 output generators × 5 input mappings
-    let mut gen5 = [0u8; 64];
-    for i in 0..8 {
-        gen5[8 * i] = VITERBI_GEN[i] & 1;
-        for j in 1..5 {
-            gen5[8 * i + j] = init[gen5[8 * i + j - 1] as usize] as u8;
-        }
-    }
-
     for state in 0..VITERBI_NUMS {
         for inp in 0..VITERBI_INPUTS {
             // Compute output bits
             let mut b = 0u8;
+            let shift = ((init[state] << 5) | inp as u32) as u16;
             for k in 0..8 {
-                b = (b << 1)
-                    | ((gen5[8 * k])
-                        ^ (gen5[8 * k + 1] & (((inp >> 3) & 1) as u8))
-                        ^ (gen5[8 * k + 2] & (((inp >> 2) & 1) as u8))
-                        ^ (gen5[8 * k + 3] & (((inp >> 1) & 1) as u8))
-                        ^ (gen5[8 * k + 4] & ((inp & 1) as u8)));
+                b = (b << 1) | ((shift & VITERBI_GEN[k] as u16).count_ones() as u8 & 1);
             }
             out_tab[state][inp] = b;
 
@@ -73,24 +60,12 @@ static NXT_TABLE: LazyLock<[[u8; VITERBI_INPUTS]; VITERBI_NUMS]> = LazyLock::new
             | ((shift_reg >> 5) ^ (shift_reg >> 2) ^ shift_reg) & 1;
     }
 
-    let mut gen5 = [0u8; 64];
-    for i in 0..8 {
-        gen5[8 * i] = VITERBI_GEN[i] & 1;
-        for j in 1..5 {
-            gen5[8 * i + j] = init[gen5[8 * i + j - 1] as usize] as u8;
-        }
-    }
-
     for state in 0..VITERBI_NUMS {
         for inp in 0..VITERBI_INPUTS {
             let mut b = 0u8;
+            let shift = ((init[state] << 5) | inp as u32) as u16;
             for k in 0..8 {
-                b = (b << 1)
-                    | ((gen5[8 * k])
-                        ^ (gen5[8 * k + 1] & (((inp >> 3) & 1) as u8))
-                        ^ (gen5[8 * k + 2] & (((inp >> 2) & 1) as u8))
-                        ^ (gen5[8 * k + 3] & (((inp >> 1) & 1) as u8))
-                        ^ (gen5[8 * k + 4] & ((inp & 1) as u8)));
+                b = (b << 1) | ((shift & VITERBI_GEN[k] as u16).count_ones() as u8 & 1);
             }
             out_tab[state][inp] = b;
 
@@ -190,32 +165,29 @@ impl Viterbi {
             .unwrap_or(0);
 
         let mut state = best_end as u8;
-        let mut decoded = vec![0u8; steps * 5 / 8 + 1];
-        let mut bit_pos = 0;
+        let mut inputs = vec![0u8; steps];
 
         for step in (0..steps).rev() {
             let prev_state = self.traceback[step][state as usize];
 
             // Extract the 5 input bits that caused transition prev_state -> state
-            let inp = find_input(prev_state as usize, state as usize);
-
-            for b in (0..5).rev() {
-                let byte_idx = bit_pos / 8;
-                let bit_off = bit_pos % 8;
-                if byte_idx < decoded.len() {
-                    if (inp >> b) & 1 == 1 {
-                        decoded[byte_idx] |= 1 << (7 - bit_off);
-                    }
-                }
-                bit_pos += 1;
-            }
-
+            inputs[step] = find_input(prev_state as usize, state as usize);
             state = prev_state;
         }
 
-        decoded.reverse();
         let byte_len = (steps * 5).div_ceil(8);
-        decoded.truncate(byte_len);
+        let mut decoded = vec![0u8; byte_len];
+        let mut bit_pos = 0;
+        for inp in inputs {
+            for b in (0..5).rev() {
+                if (inp >> b) & 1 == 1 {
+                    let byte_idx = bit_pos / 8;
+                    let bit_off = bit_pos % 8;
+                    decoded[byte_idx] |= 1 << (7 - bit_off);
+                }
+                bit_pos += 1;
+            }
+        }
         self.out_buf = decoded;
         &self.out_buf
     }

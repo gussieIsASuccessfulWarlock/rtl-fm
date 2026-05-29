@@ -23,6 +23,7 @@ pub struct OfdmFramer {
     fft_buf: Vec<Complex<f32>>,
     symbols_seen: u64,
     acquisition: AcquisitionStats,
+    timing_locked: bool,
     pub sync: Sync,
 }
 
@@ -37,6 +38,7 @@ impl OfdmFramer {
             fft_buf: Vec::with_capacity(OFDM_FFT_LEN),
             symbols_seen: 0,
             acquisition: AcquisitionStats::default(),
+            timing_locked: false,
             sync: Sync::new(),
         }
     }
@@ -57,9 +59,17 @@ impl OfdmFramer {
             return false;
         };
         self.acquisition = acq;
-        if acq.timing_offset > 0 {
+        if !self.timing_locked && !acq.locked {
+            if self.buf.len() > OFDM_SYMBOL_LEN + OFDM_CP_LEN {
+                self.buf.drain(..OFDM_CP_LEN);
+            }
+            return false;
+        }
+
+        if !self.timing_locked && acq.timing_offset > 0 {
             self.buf.drain(..acq.timing_offset);
         }
+        self.timing_locked = true;
 
         let sym: Vec<Complex<f32>> = self.buf.drain(..OFDM_SYMBOL_LEN).collect();
         let body = &sym[OFDM_CP_LEN..];
@@ -87,32 +97,44 @@ impl OfdmFramer {
         if self.buf.len() < OFDM_SYMBOL_LEN {
             return None;
         }
-        let search = (self.buf.len() - OFDM_SYMBOL_LEN).min(OFDM_CP_LEN * 2);
+        if self.timing_locked {
+            let mut stats = self.cp_stats_at(0);
+            stats.locked = true;
+            return Some(stats);
+        }
+
+        let search = (self.buf.len() - OFDM_SYMBOL_LEN).min(OFDM_SYMBOL_LEN - 1);
         let mut best = AcquisitionStats::default();
-        let mut best_corr = Complex::new(0.0, 0.0);
         for off in 0..=search {
-            let mut corr = Complex::new(0.0f32, 0.0);
-            let mut p0 = 0.0f32;
-            let mut p1 = 0.0f32;
-            for i in 0..OFDM_CP_LEN {
-                let a = self.buf[off + i];
-                let b = self.buf[off + OFDM_FFT_LEN + i];
-                corr += a.conj() * b;
-                p0 += a.norm_sqr();
-                p1 += b.norm_sqr();
-            }
-            let denom = (p0 * p1).sqrt().max(1e-12);
-            let metric = corr.norm() / denom;
-            if metric > best.cp_metric {
-                best.cp_metric = metric;
-                best.timing_offset = off;
-                best_corr = corr;
+            let stats = self.cp_stats_at(off);
+            if stats.cp_metric > best.cp_metric {
+                best = stats;
             }
         }
-        let angle = best_corr.im.atan2(best_corr.re);
-        best.coarse_cfo_hz = angle * NRSC5_IQ_RATE / (2.0 * std::f32::consts::PI * OFDM_FFT_LEN as f32);
         best.locked = best.cp_metric > 0.25;
         Some(best)
+    }
+
+    fn cp_stats_at(&self, off: usize) -> AcquisitionStats {
+        let mut corr = Complex::new(0.0f32, 0.0);
+        let mut p0 = 0.0f32;
+        let mut p1 = 0.0f32;
+        for i in 0..OFDM_CP_LEN {
+            let a = self.buf[off + i];
+            let b = self.buf[off + OFDM_FFT_LEN + i];
+            corr += a.conj() * b;
+            p0 += a.norm_sqr();
+            p1 += b.norm_sqr();
+        }
+        let denom = (p0 * p1).sqrt().max(1e-12);
+        let metric = corr.norm() / denom;
+        let angle = corr.im.atan2(corr.re);
+        AcquisitionStats {
+            timing_offset: off,
+            cp_metric: metric,
+            coarse_cfo_hz: angle * NRSC5_IQ_RATE / (2.0 * std::f32::consts::PI * OFDM_FFT_LEN as f32),
+            locked: metric > 0.12,
+        }
     }
 
     pub fn symbols_seen(&self) -> u64 {
