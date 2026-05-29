@@ -41,21 +41,31 @@ use crate::nrsc5::interleave::Deinterleaver;
 use crate::nrsc5::ofdm::OfdmFramer;
 use crate::nrsc5::resample::ComplexResampler;
 use crate::nrsc5::viterbi::Viterbi;
+use crate::dsp::nco::Nco;
 use crate::usb::transfer::IqChunk;
 
 /// Driver for one HD-Radio decoder instance.
 pub struct NrscDecoder {
     iq_rx: broadcast::Receiver<IqChunk>,
     metadata: StationMetadata,
+    station_hz: u32,
+    center_hz: u32,
     resamp: ComplexResampler,
     framer: OfdmFramer,
 }
 
 impl NrscDecoder {
-    pub fn new(iq_rx: broadcast::Receiver<IqChunk>, metadata: StationMetadata) -> Self {
+    pub fn new(
+        iq_rx: broadcast::Receiver<IqChunk>,
+        metadata: StationMetadata,
+        station_hz: u32,
+        center_hz: u32,
+    ) -> Self {
         Self {
             iq_rx,
             metadata,
+            station_hz,
+            center_hz,
             resamp: ComplexResampler::new(),
             framer: OfdmFramer::new(),
         }
@@ -64,7 +74,15 @@ impl NrscDecoder {
     pub async fn run(mut self) {
         info!("NRSC-5 decoder started");
         let mut iq_complex: Vec<num_complex::Complex<f32>> = Vec::with_capacity(16_384);
+        let mut mixed: Vec<num_complex::Complex<f32>> = Vec::with_capacity(16_384);
         let mut resampled: Vec<num_complex::Complex<f32>> = Vec::with_capacity(8_192);
+        let offset_hz = self.station_hz as f32 - self.center_hz as f32;
+        let mut nco = Nco::new(-offset_hz, crate::nrsc5::consts::RTL_IQ_RATE);
+        info!(
+            "NRSC-5 centered decode: station={} kHz center={} kHz offset={offset_hz:.1} Hz",
+            self.station_hz / 1000,
+            self.center_hz / 1000,
+        );
 
         let mut deinterleaver = Deinterleaver::new();
         let mut viterbi = Viterbi::new();
@@ -86,8 +104,12 @@ impl NrscDecoder {
             };
 
             crate::dsp::u8_iq_to_complex(&chunk, &mut iq_complex);
+            mixed.clear();
+            for &z in &iq_complex {
+                mixed.push(z * nco.step());
+            }
             resampled.clear();
-            self.resamp.process(&iq_complex, &mut resampled);
+            self.resamp.process(&mixed, &mut resampled);
             self.framer.feed(&resampled);
 
             while self.framer.process_one_symbol() {
@@ -111,6 +133,20 @@ impl NrscDecoder {
 
                     pdus.clear();
                     frame_dec.process_frame(decoded, &mut pdus);
+                    if frames_processed.is_multiple_of(20) {
+                        debug!(
+                            "NRSC-5 stats: symbols={} cp_metric={:.3} cfo={:.1}Hz timing={} cp_locked={} frame_aligned={} soft_bits={} pdus={} lot_ready={}",
+                            self.framer.symbols_seen(),
+                            self.framer.acquisition().cp_metric,
+                            self.framer.acquisition().coarse_cfo_hz,
+                            self.framer.acquisition().timing_offset,
+                            self.framer.acquisition().locked,
+                            self.framer.sync.frame_aligned,
+                            decoded.len(),
+                            pdus.len(),
+                            aas.completed_objects.len(),
+                        );
+                    }
                     aas.process_pdus(&pdus);
                     frames_processed += 1;
 
@@ -171,8 +207,10 @@ impl NrscDecoder {
 pub fn spawn(
     iq_rx: broadcast::Receiver<IqChunk>,
     metadata: StationMetadata,
+    station_hz: u32,
+    center_hz: u32,
 ) -> tokio::task::JoinHandle<()> {
-    let dec = NrscDecoder::new(iq_rx, metadata);
+    let dec = NrscDecoder::new(iq_rx, metadata, station_hz, center_hz);
     tokio::spawn(async move { dec.run().await })
 }
 

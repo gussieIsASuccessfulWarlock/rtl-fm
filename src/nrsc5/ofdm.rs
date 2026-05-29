@@ -5,8 +5,16 @@ use std::sync::Arc;
 use num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
-use crate::nrsc5::consts::{OFDM_CP_LEN, OFDM_FFT_LEN, OFDM_SYMBOL_LEN};
+use crate::nrsc5::consts::{NRSC5_IQ_RATE, OFDM_CP_LEN, OFDM_FFT_LEN, OFDM_SYMBOL_LEN};
 use crate::nrsc5::sync::Sync;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AcquisitionStats {
+    pub timing_offset: usize,
+    pub cp_metric: f32,
+    pub coarse_cfo_hz: f32,
+    pub locked: bool,
+}
 
 pub struct OfdmFramer {
     buf: Vec<Complex<f32>>,
@@ -14,6 +22,7 @@ pub struct OfdmFramer {
     fft_in: Vec<Complex<f32>>,
     fft_buf: Vec<Complex<f32>>,
     symbols_seen: u64,
+    acquisition: AcquisitionStats,
     pub sync: Sync,
 }
 
@@ -27,6 +36,7 @@ impl OfdmFramer {
             fft_in: vec![Complex::new(0.0, 0.0); OFDM_FFT_LEN],
             fft_buf: Vec::with_capacity(OFDM_FFT_LEN),
             symbols_seen: 0,
+            acquisition: AcquisitionStats::default(),
             sync: Sync::new(),
         }
     }
@@ -42,10 +52,25 @@ impl OfdmFramer {
         if self.buf.len() < OFDM_SYMBOL_LEN {
             return false;
         }
+
+        let Some(acq) = self.acquire_symbol() else {
+            return false;
+        };
+        self.acquisition = acq;
+        if acq.timing_offset > 0 {
+            self.buf.drain(..acq.timing_offset);
+        }
+
         let sym: Vec<Complex<f32>> = self.buf.drain(..OFDM_SYMBOL_LEN).collect();
         let body = &sym[OFDM_CP_LEN..];
 
-        self.fft_in[..OFDM_FFT_LEN].copy_from_slice(&body[..OFDM_FFT_LEN]);
+        let phase_step = -2.0 * std::f32::consts::PI * acq.coarse_cfo_hz / NRSC5_IQ_RATE;
+        let mut phase = phase_step * OFDM_CP_LEN as f32;
+        for (dst, &src) in self.fft_in.iter_mut().zip(body.iter()) {
+            let rot = Complex::new(phase.cos(), phase.sin());
+            *dst = src * rot;
+            phase += phase_step;
+        }
         self.fft.process(&mut self.fft_in);
 
         self.fft_buf.clear();
@@ -58,8 +83,44 @@ impl OfdmFramer {
         true
     }
 
+    fn acquire_symbol(&self) -> Option<AcquisitionStats> {
+        if self.buf.len() < OFDM_SYMBOL_LEN {
+            return None;
+        }
+        let search = (self.buf.len() - OFDM_SYMBOL_LEN).min(OFDM_CP_LEN * 2);
+        let mut best = AcquisitionStats::default();
+        let mut best_corr = Complex::new(0.0, 0.0);
+        for off in 0..=search {
+            let mut corr = Complex::new(0.0f32, 0.0);
+            let mut p0 = 0.0f32;
+            let mut p1 = 0.0f32;
+            for i in 0..OFDM_CP_LEN {
+                let a = self.buf[off + i];
+                let b = self.buf[off + OFDM_FFT_LEN + i];
+                corr += a.conj() * b;
+                p0 += a.norm_sqr();
+                p1 += b.norm_sqr();
+            }
+            let denom = (p0 * p1).sqrt().max(1e-12);
+            let metric = corr.norm() / denom;
+            if metric > best.cp_metric {
+                best.cp_metric = metric;
+                best.timing_offset = off;
+                best_corr = corr;
+            }
+        }
+        let angle = best_corr.im.atan2(best_corr.re);
+        best.coarse_cfo_hz = angle * NRSC5_IQ_RATE / (2.0 * std::f32::consts::PI * OFDM_FFT_LEN as f32);
+        best.locked = best.cp_metric > 0.25;
+        Some(best)
+    }
+
     pub fn symbols_seen(&self) -> u64 {
         self.symbols_seen
+    }
+
+    pub fn acquisition(&self) -> AcquisitionStats {
+        self.acquisition
     }
 
     /// Current frequency-domain symbol (length OFDM_FFT_LEN).

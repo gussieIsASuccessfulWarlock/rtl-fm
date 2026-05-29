@@ -262,7 +262,7 @@ impl Channelizer {
             })
             .await;
         });
-        let hd_task = crate::nrsc5::spawn(iq_rx_hd, meta_slot);
+        let hd_task = crate::nrsc5::spawn(iq_rx_hd, meta_slot, freq_hz, center_hz);
         active.map.insert(freq_hz, ActiveChannel { tx, task, hd_task });
         rx
     }
