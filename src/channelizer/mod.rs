@@ -240,7 +240,9 @@ impl Channelizer {
             if !existing.task.is_finished() {
                 return existing.tx.subscribe();
             }
-            active.map.remove(&freq_hz);
+            if let Some(old) = active.map.remove(&freq_hz) {
+                old.hd_task.abort();
+            }
         }
 
         let (tx, rx) = broadcast::channel::<PcmBlock>(64);
