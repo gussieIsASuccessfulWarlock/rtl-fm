@@ -29,7 +29,7 @@ Prebuilt x86_64 Linux binaries are published on the [Releases](../../releases) p
 ```sh
 # Replace v0.1.0 with the latest tag from the Releases page.
 curl -L -o rtl-fm.tar.gz \
-  https://github.com/OWNER/REPO/releases/download/v0.1.0/rtl-fm-v0.1.0-x86_64-linux.tar.gz
+  https://github.com/gussieIsASuccessfulWarlock/rtl-fm/releases/download/v0.1.0/rtl-fm-v0.1.0-x86_64-linux.tar.gz
 tar -xzf rtl-fm.tar.gz
 chmod +x rtl-fm
 sudo mv rtl-fm /usr/local/bin/
