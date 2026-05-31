@@ -1,256 +1,369 @@
-//! HD Radio (NRSC-5) decoder.
-//!
-//! Layered decoder stack:
-//!
-//! | Layer                    | File           | Status |
-//! |--------------------------|----------------|--------|
-//! | Resampler 2.4 MS/s→744k  | `resample.rs`  | done   |
-//! | OFDM symbol framer + FFT | `ofdm.rs`      | done   |
-//! | Reference / sync         | `sync.rs`      | done   |
-//! | Constellation demap      | `demap.rs`     | done   |
-//! | Block deinterleaver      | `interleave.rs`| done   |
-//! | Viterbi (rate-5/8)       | `viterbi.rs`   | done   |
-//! | Reed-Solomon (255,223)   | `rs.rs`        | done   |
-//! | L1 framing               | `frame.rs`     | done   |
-//! | AAS / PSD / SIG / LOT    | `aas.rs`       | done   |
-//!
-//! Reference: Theori `nrsc5` C implementation; NRSC-5-D standard.
-
 pub mod aas;
+pub mod block_eq;
 pub mod consts;
 pub mod demap;
 pub mod frame;
 pub mod interleave;
+pub mod l1;
+pub mod lot;
 pub mod ofdm;
+pub mod pids;
 pub mod resample;
 pub mod rs;
 pub mod sync;
 pub mod viterbi;
 
+use rustfft::num_complex::Complex;
 use std::sync::Arc;
-
 use tokio::sync::broadcast;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::channelizer::metadata::StationMetadata;
-use crate::nrsc5::aas::AasDecoder;
-use crate::nrsc5::consts::FRAME_SYMBOLS;
-use crate::nrsc5::demap::P1_DATA_SC;
-use crate::nrsc5::frame::FrameDecoder;
-use crate::nrsc5::interleave::Deinterleaver;
-use crate::nrsc5::ofdm::OfdmFramer;
-use crate::nrsc5::resample::ComplexResampler;
-use crate::nrsc5::viterbi::Viterbi;
 use crate::dsp::nco::Nco;
+use crate::nrsc5::aas::{AasDemux, AasPacket};
+use crate::nrsc5::block_eq::BlockEqualizer;
+use crate::nrsc5::consts::BLKSZ;
+use crate::nrsc5::frame::FrameParser;
+use crate::nrsc5::lot::LotAssembler;
+use crate::nrsc5::ofdm::OfdmFramer;
+use crate::nrsc5::pids::PidsDecoder;
+use crate::nrsc5::resample::{ComplexResampler, HalfbandDecimator};
+use crate::nrsc5::sync::Sync;
+use crate::nrsc5::viterbi::Viterbi;
 use crate::usb::transfer::IqChunk;
 
-/// Driver for one HD-Radio decoder instance.
-pub struct NrscDecoder {
-    iq_rx: broadcast::Receiver<IqChunk>,
-    metadata: StationMetadata,
-    station_hz: u32,
-    center_hz: u32,
-    resamp: ComplexResampler,
-    framer: OfdmFramer,
-}
-
-impl NrscDecoder {
-    pub fn new(
-        iq_rx: broadcast::Receiver<IqChunk>,
-        metadata: StationMetadata,
-        station_hz: u32,
-        center_hz: u32,
-    ) -> Self {
-        Self {
-            iq_rx,
-            metadata,
-            station_hz,
-            center_hz,
-            resamp: ComplexResampler::new(),
-            framer: OfdmFramer::new(),
-        }
-    }
-
-    pub async fn run(mut self) {
-        info!("NRSC-5 decoder started");
-        let mut iq_complex: Vec<num_complex::Complex<f32>> = Vec::with_capacity(16_384);
-        let mut mixed: Vec<num_complex::Complex<f32>> = Vec::with_capacity(16_384);
-        let mut resampled: Vec<num_complex::Complex<f32>> = Vec::with_capacity(8_192);
-        let offset_hz = self.station_hz as f32 - self.center_hz as f32;
-        let mut nco = Nco::new(-offset_hz, crate::nrsc5::consts::RTL_IQ_RATE);
-        info!(
-            "NRSC-5 centered decode: station={} kHz center={} kHz offset={offset_hz:.1} Hz",
-            self.station_hz / 1000,
-            self.center_hz / 1000,
-        );
-
-        let mut deinterleaver = Deinterleaver::new();
-        let mut viterbi = Viterbi::new();
-        let mut frame_dec = FrameDecoder::new();
-        let mut aas = AasDecoder::new();
-
-        let mut soft_buf: Vec<u8> = Vec::with_capacity(P1_DATA_SC.len() * 2);
-        let mut deint_buf: Vec<u8> = Vec::with_capacity(P1_DATA_SC.len() * 2);
-        let mut frame_soft_bits: Vec<u8> = Vec::with_capacity(P1_DATA_SC.len() * 2 * FRAME_SYMBOLS);
-        let mut pdus: Vec<frame::P1Pdu> = Vec::new();
-
-        let mut frames_processed: u64 = 0;
-        let mut chunks_seen: u64 = 0;
-
-        loop {
-            let chunk = match self.iq_rx.recv().await {
-                Ok(c) => c,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            };
-
-            crate::dsp::u8_iq_to_complex(&chunk, &mut iq_complex);
-            chunks_seen += 1;
-            mixed.clear();
-            for &z in &iq_complex {
-                mixed.push(z * nco.step());
-            }
-            resampled.clear();
-            self.resamp.process(&mixed, &mut resampled);
-            self.framer.feed(&resampled);
-            if chunks_seen.is_multiple_of(256) && !self.framer.sync.frame_aligned {
-                debug!(
-                    "NRSC-5 acquisition pending: chunks={} symbols={} cp_metric={:.3} cfo={:.1}Hz timing={} cp_locked={}",
-                    chunks_seen,
-                    self.framer.symbols_seen(),
-                    self.framer.acquisition().cp_metric,
-                    self.framer.acquisition().coarse_cfo_hz,
-                    self.framer.acquisition().timing_offset,
-                    self.framer.acquisition().locked,
-                );
-            }
-
-            while self.framer.process_one_symbol() {
-                if self.framer.symbols_seen().is_multiple_of(1024) {
-                    debug!(
-                        "NRSC-5 acquisition: symbols={} cp_metric={:.3} cfo={:.1}Hz timing={} cp_locked={} frame_aligned={} frame_metric={:.3} frame_offset={}",
-                        self.framer.symbols_seen(),
-                        self.framer.acquisition().cp_metric,
-                        self.framer.acquisition().coarse_cfo_hz,
-                        self.framer.acquisition().timing_offset,
-                        self.framer.acquisition().locked,
-                        self.framer.sync.frame_aligned,
-                        self.framer.sync.frame_metric,
-                        self.framer.sync.frame_offset,
-                    );
-                }
-                if !self.framer.sync.frame_aligned {
-                    continue;
-                }
-
-                let fft_bins = self.framer.fft_buf();
-                let ref_est = &self.framer.sync.channel_estimates;
-
-                soft_buf.clear();
-                demap::equalize_and_demap(fft_bins, ref_est, &P1_DATA_SC, &mut soft_buf);
-
-                deint_buf.clear();
-                deinterleaver.process(&soft_buf, &mut deint_buf);
-                frame_soft_bits.extend_from_slice(&deint_buf);
-
-                if frame_soft_bits.len() >= P1_DATA_SC.len() * 2 * FRAME_SYMBOLS {
-                    let decoded = viterbi.decode(&frame_soft_bits);
-                    frame_soft_bits.clear();
-
-                    pdus.clear();
-                    frame_dec.process_frame(decoded, &mut pdus);
-                    if frames_processed.is_multiple_of(20) {
-                        let decoded_nonzero = decoded.iter().filter(|&&b| b != 0).count();
-                        let decoded_ones: u32 = decoded.iter().map(|b| b.count_ones()).sum();
-                        debug!(
-                            "NRSC-5 stats: symbols={} cp_metric={:.3} cfo={:.1}Hz timing={} cp_locked={} frame_aligned={} decoded_bytes={} nonzero={} ones={} rs_ok={} rs_fail={} crc_ok={} crc_fail={} pdus={} lot_ready={}",
-                            self.framer.symbols_seen(),
-                            self.framer.acquisition().cp_metric,
-                            self.framer.acquisition().coarse_cfo_hz,
-                            self.framer.acquisition().timing_offset,
-                            self.framer.acquisition().locked,
-                            self.framer.sync.frame_aligned,
-                            decoded.len(),
-                            decoded_nonzero,
-                            decoded_ones,
-                            frame_dec.stats().rs_ok,
-                            frame_dec.stats().rs_fail,
-                            frame_dec.stats().pdu_crc_ok,
-                            frame_dec.stats().pdu_crc_fail,
-                            pdus.len(),
-                            aas.completed_objects.len(),
-                        );
-                    }
-                    aas.process_pdus(&pdus);
-                    frames_processed += 1;
-
-                    if frames_processed.is_multiple_of(10) {
-                        let dto = aas.to_metadata_dto();
-                        if dto.radiotext.is_some() || dto.ps.is_some() {
-                            debug!("NRSC-5 PSD: {:?} {:?}", dto.ps, dto.radiotext);
-                        }
-                        if !aas.completed_objects.is_empty() {
-                            for obj in aas.completed_objects.drain(..) {
-                                let mime: Option<String> = if obj.data.len() > 4
-                                    && obj.data[0] == 0xFF && obj.data[1] == 0xD8
-                                {
-                                    Some("image/jpeg".to_string())
-                                } else if obj.data.len() > 8
-                                    && &obj.data[0..8] == b"\x89PNG\r\n\x1a\n"
-                                {
-                                    Some("image/png".to_string())
-                                } else {
-                                    None
-                                };
-                                info!(
-                                    "NRSC-5 LOT complete: {} bytes, mime={:?}, lot_id={}",
-                                    obj.data.len(), mime, obj.lot_id
-                                );
-                                self.metadata.update_hd_album_art(mime, obj.data);
-                            }
-                        }
-                    }
-
-                    if frames_processed.is_multiple_of(54) {
-                        let dto = aas.to_metadata_dto();
-                        self.metadata.update_hd(aas.to_hd_metadata());
-                        let rds_meta = crate::dsp::rds_decoder::RdsMetadata {
-                            pi: None,
-                            callsign: dto.callsign,
-                            ps: dto.ps,
-                            rt: dto.radiotext,
-                            pty: None,
-                            pty_name: None,
-                            tp: false,
-                            ta: false,
-                            ms_music: true,
-                            groups_decoded: 0,
-                            blocks_dropped: 0,
-                        };
-                        self.metadata.update_rds(rds_meta);
-                    }
-                }
-            }
-        }
-
-        info!("NRSC-5 decoder exiting after {frames_processed} frames");
-    }
-}
-
-/// Convenience: spawn a decoder task for a given station.
 pub fn spawn(
     iq_rx: broadcast::Receiver<IqChunk>,
     metadata: StationMetadata,
     station_hz: u32,
     center_hz: u32,
+    input_rate: u32,
 ) -> tokio::task::JoinHandle<()> {
-    let dec = NrscDecoder::new(iq_rx, metadata, station_hz, center_hz);
-    tokio::spawn(async move { dec.run().await })
+    tokio::spawn(async move {
+        if let Err(e) = run(iq_rx, Arc::new(metadata), station_hz, center_hz, input_rate).await {
+            tracing::warn!("NRSC-5 task exit: {e:#}");
+        }
+    })
 }
 
-/// Reserved for downstream album-art delivery.
-#[derive(Debug, Clone, Default)]
-pub struct AlbumArt {
-    pub mime: Option<String>,
-    pub bytes: Arc<[u8]>,
+pub async fn run(
+    mut iq_rx: broadcast::Receiver<IqChunk>,
+    metadata: Arc<StationMetadata>,
+    station_hz: u32,
+    center_hz: u32,
+    input_rate: u32,
+) -> anyhow::Result<()> {
+    let mut decoder = Nrsc5Decoder::new(metadata, station_hz, center_hz, input_rate);
+    info!(
+        "NRSC-5 decoder started (input_rate={input_rate} dedicated={})",
+        decoder.dedicated()
+    );
+
+    loop {
+        let chunk = match iq_rx.recv().await {
+            Ok(c) => c,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                info!("NRSC-5 lagged {n} IQ chunks; resetting decoder state");
+                let meta = decoder.metadata.clone();
+                decoder = Nrsc5Decoder::new(meta, station_hz, center_hz, input_rate);
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        };
+        decoder.process_chunk(&chunk);
+    }
+    info!(
+        "NRSC-5 decoder exiting after {} P1 frames",
+        decoder.frames_processed()
+    );
+    Ok(())
+}
+
+/// Self-contained NRSC-5 FM P1 decoder.
+///
+/// Owns all per-station DSP state: NCO, resampler, OFDM framer, frame
+/// sync, block equalizer, both Viterbi instances (P1 + PIDS), the L2
+/// frame parser, AAS demultiplexer, and LOT reassembler. Drives the
+/// shared [`StationMetadata`] when station-short-name or album art
+/// surface.
+///
+/// Use [`process_chunk`](Self::process_chunk) to feed raw u8 IQ samples
+/// (interleaved I/Q at the configured `input_rate`). The same struct
+/// powers both the live HD scan path and the offline replay harness so
+/// there is one decode chain to debug, not two.
+pub struct Nrsc5Decoder {
+    pub metadata: Arc<StationMetadata>,
+    station_hz: u32,
+    center_hz: u32,
+    input_rate: u32,
+    dedicated: bool,
+
+    nco: Nco,
+    resamp_poly: Option<ComplexResampler>,
+    resamp_half: Option<HalfbandDecimator>,
+    framer: OfdmFramer,
+    sync: Sync,
+    block_eq: BlockEqualizer,
+    viterbi: Viterbi,
+    pids_viterbi: Viterbi,
+    pids_decoder: PidsDecoder,
+    frame_parser: FrameParser,
+    aas_demux: AasDemux,
+    lot_assembler: LotAssembler,
+
+    iq_complex: Vec<Complex<f32>>,
+    mixed: Vec<Complex<f32>>,
+    resampled: Vec<Complex<f32>>,
+    pm_buf: Vec<i8>,
+    depunctured: Vec<i8>,
+    decoded_bits: Vec<u8>,
+    viterbi_pids_buf: Vec<i8>,
+    decoded_pids_bits: Vec<u8>,
+    block_sym_buf: Vec<Vec<Complex<f32>>>,
+
+    symbols_since_lock: u64,
+    frames_processed: u64,
+    chunks_seen: u64,
+    last_log: u64,
+    first_lock: bool,
+}
+
+impl Nrsc5Decoder {
+    pub fn new(
+        metadata: Arc<StationMetadata>,
+        station_hz: u32,
+        center_hz: u32,
+        input_rate: u32,
+    ) -> Self {
+        let dedicated = input_rate == crate::nrsc5::consts::NRSC5_RTL_RATE;
+        let offset_hz = station_hz as f32 - center_hz as f32;
+        let nco_rate = if dedicated {
+            crate::nrsc5::consts::NRSC5_RTL_RATE as f32
+        } else {
+            crate::nrsc5::consts::RTL_IQ_RATE
+        };
+        let nco = Nco::new(-offset_hz, nco_rate);
+        let resamp_poly = if !dedicated {
+            Some(ComplexResampler::new())
+        } else {
+            None
+        };
+        let resamp_half = if dedicated {
+            Some(HalfbandDecimator::new())
+        } else {
+            None
+        };
+
+        Self {
+            metadata,
+            station_hz,
+            center_hz,
+            input_rate,
+            dedicated,
+            nco,
+            resamp_poly,
+            resamp_half,
+            framer: OfdmFramer::new(),
+            sync: Sync::new(),
+            block_eq: BlockEqualizer::new(),
+            viterbi: Viterbi::new(),
+            pids_viterbi: Viterbi::new(),
+            pids_decoder: PidsDecoder::new(),
+            frame_parser: FrameParser::default(),
+            aas_demux: AasDemux::default(),
+            lot_assembler: LotAssembler::default(),
+            iq_complex: Vec::with_capacity(16_384),
+            mixed: Vec::with_capacity(16_384),
+            resampled: Vec::with_capacity(8_192),
+            pm_buf: vec![0i8; 16 * 32 * 720],
+            depunctured: Vec::new(),
+            decoded_bits: Vec::new(),
+            viterbi_pids_buf: Vec::with_capacity(240),
+            decoded_pids_bits: Vec::with_capacity(80),
+            block_sym_buf: Vec::with_capacity(BLKSZ),
+            symbols_since_lock: 0,
+            frames_processed: 0,
+            chunks_seen: 0,
+            last_log: 0,
+            first_lock: true,
+        }
+    }
+
+    pub fn dedicated(&self) -> bool {
+        self.dedicated
+    }
+    pub fn station_hz(&self) -> u32 {
+        self.station_hz
+    }
+    pub fn center_hz(&self) -> u32 {
+        self.center_hz
+    }
+    pub fn input_rate(&self) -> u32 {
+        self.input_rate
+    }
+    pub fn frames_processed(&self) -> u64 {
+        self.frames_processed
+    }
+    pub fn chunks_seen(&self) -> u64 {
+        self.chunks_seen
+    }
+
+    /// Feed one bulk-URB-sized chunk of raw u8 IQ samples (interleaved
+    /// I/Q at `input_rate`). Drives the full PHY → L1 → L2 → AAS → LOT
+    /// pipeline and updates [`Self::metadata`] when station name or
+    /// album-art surface.
+    pub fn process_chunk(&mut self, chunk: &[u8]) {
+        crate::dsp::u8_iq_to_complex(chunk, &mut self.iq_complex);
+        self.chunks_seen += 1;
+
+        self.mixed.clear();
+        for &z in &self.iq_complex {
+            self.mixed.push(z * self.nco.step());
+        }
+        self.resampled.clear();
+        if let Some(r) = self.resamp_poly.as_mut() {
+            r.process(&self.mixed, &mut self.resampled);
+        } else if let Some(r) = self.resamp_half.as_mut() {
+            r.process(&self.mixed, &mut self.resampled);
+        }
+        self.framer.feed(&self.resampled);
+
+        while self.framer.process_one_symbol() {
+            self.sync.process_symbol(self.framer.fft_buf());
+
+            if self.framer.symbols_seen - self.last_log >= 256 {
+                self.last_log = self.framer.symbols_seen;
+                info!(
+                    "NRSC-5 status: chunks={} symbols={} cp_metric={:.3} cfo={:.1}Hz frame_aligned={} frame_metric={:.3} best_vote={}@{} bin_cfo={} bc={}",
+                    self.chunks_seen,
+                    self.framer.symbols_seen,
+                    self.framer.acquisition.cp_metric,
+                    self.framer.acquisition.cfo_hz,
+                    self.sync.frame_aligned,
+                    self.sync.frame_metric,
+                    self.sync.best_count_recent,
+                    self.sync.best_offset_recent,
+                    self.sync.integer_cfo_bins,
+                    self.sync.block_count,
+                );
+            }
+
+            if !self.sync.frame_aligned {
+                self.first_lock = true;
+                self.block_sym_buf.clear();
+                continue;
+            }
+
+            if self.first_lock {
+                self.symbols_since_lock = self.sync.current_row() as u64;
+                self.block_eq.init_costas(
+                    &self.sync.costas_phase,
+                    &self.sync.costas_freq,
+                    self.sync.integer_cfo_bins,
+                );
+                self.block_sym_buf.clear();
+                self.first_lock = false;
+            }
+
+            let row = (self.symbols_since_lock % BLKSZ as u64) as usize;
+            if row == 0 {
+                self.block_sym_buf.clear();
+            }
+            self.block_sym_buf.push(self.framer.fft_buf().to_vec());
+            self.symbols_since_lock += 1;
+
+            if row == BLKSZ - 1 && self.block_sym_buf.len() == BLKSZ {
+                let block = ((self.sync.block_count as u64
+                    + (self.symbols_since_lock / BLKSZ as u64).saturating_sub(1))
+                    % 16) as usize;
+
+                let dst_start = block * BLKSZ * 720;
+                self.block_eq.process_block(
+                    &self.block_sym_buf,
+                    &mut self.pm_buf[dst_start..dst_start + BLKSZ * 720],
+                );
+
+                // PIDS decode (every block)
+                crate::nrsc5::interleave::deinterleave_pids_fm(
+                    &self.pm_buf,
+                    &mut self.viterbi_pids_buf,
+                    block,
+                );
+                self.pids_viterbi
+                    .decode(&self.viterbi_pids_buf, &mut self.decoded_pids_bits, 80);
+                descramble_bits(&mut self.decoded_pids_bits);
+                self.pids_decoder.process(&self.decoded_pids_bits);
+                if !self.pids_decoder.station_name.is_empty() {
+                    let hd = crate::channelizer::metadata::HdMetadataDto {
+                        station_name: Some(self.pids_decoder.station_name.clone()),
+                        ..Default::default()
+                    };
+                    self.metadata.update_hd(hd);
+                }
+
+                // P1 decode once per full 16-block superframe.
+                if block == 15 {
+                    crate::nrsc5::interleave::deinterleave_p1_fm(
+                        &self.pm_buf,
+                        &mut self.depunctured,
+                    );
+                    self.viterbi.decode(
+                        &self.depunctured,
+                        &mut self.decoded_bits,
+                        crate::nrsc5::consts::P1_FRAME_LEN_FM,
+                    );
+                    let raw_first32: String = self
+                        .decoded_bits
+                        .iter()
+                        .take(32)
+                        .map(|&b| if b != 0 { '1' } else { '0' })
+                        .collect();
+                    descramble_bits(&mut self.decoded_bits);
+                    self.frames_processed += 1;
+                    let desc_first32: String = self
+                        .decoded_bits
+                        .iter()
+                        .take(32)
+                        .map(|&b| if b != 0 { '1' } else { '0' })
+                        .collect();
+                    let soft_sample: Vec<i8> = (0..12).map(|i| self.depunctured[i]).collect();
+                    let mut p1_payload = Vec::new();
+                    let pci =
+                        crate::nrsc5::l1::extract_p1_payload(&self.decoded_bits, &mut p1_payload);
+                    info!(
+                        "NRSC-5 P1 #{} PCI={:06X} soft[0..12]={:?} raw32={} desc32={}",
+                        self.frames_processed, pci, soft_sample, raw_first32, desc_first32
+                    );
+
+                    let parsed = self.frame_parser.process(&p1_payload, pci, 0);
+                    let aas_pkts = self.aas_demux.feed_stream(&parsed.aas_pdu);
+                    for pkt in aas_pkts {
+                        if let AasPacket::Lot { port, payload, .. } = pkt {
+                            if let Some(obj) = self.lot_assembler.push(port, &payload) {
+                                info!(
+                                    "NRSC-5 LOT object: name={} mime={} size={}",
+                                    obj.name,
+                                    obj.mime,
+                                    obj.data.len()
+                                );
+                                if obj.mime.starts_with("image/") {
+                                    self.metadata.update_hd_album_art(Some(obj.mime), obj.data);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn descramble_bits(bits: &mut [u8]) {
+    let mut val: u16 = 0x3FF;
+    for b in bits.iter_mut() {
+        let bit = (((val >> 9) ^ val) & 1) as u16;
+        val |= bit << 11;
+        val >>= 1;
+        *b ^= bit as u8;
+    }
 }

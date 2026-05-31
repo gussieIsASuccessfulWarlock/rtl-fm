@@ -23,8 +23,13 @@ use tracing::{info, warn};
 use crate::dsp::u8_iq_to_complex;
 use crate::encode::PcmBlock;
 use crate::error::RtlError;
-use crate::rtlsdr::{DEFAULT_SAMPLE_RATE, RtlSdr};
+use crate::rtlsdr::{RtlSdr, DEFAULT_SAMPLE_RATE};
 use crate::usb::transfer::IqChunk;
+
+/// PCM fanout depth. 256 FLAC-sized PCM blocks is roughly 24 seconds
+/// of audio, which gives mobile browsers room to pause fetch delivery
+/// briefly without forcing the DSP task to drop the listener.
+const PCM_BROADCAST_BLOCKS: usize = 256;
 
 /// Half-bandwidth of the RTL-SDR tuner window we trust as "usable"
 /// (excludes the edges where the analog filters roll off).
@@ -43,6 +48,17 @@ pub struct ScannedChannel {
     pub name: String,
     pub freq_hz: u32,
     pub power_db: f32,
+}
+
+/// Progress reported by [`Channelizer::scan_band`] so a caller can render
+/// a progress bar. The scan is two coarse energy sweeps followed by a
+/// per-candidate pilot-verification pass (the slow, countable part).
+#[derive(Debug, Clone, Copy)]
+pub enum ScanProgress {
+    /// Energy sweep phase: `done` of `total` passes finished.
+    Sweep { done: u64, total: u64 },
+    /// Pilot verification: `done` of `total` candidates checked.
+    Verify { done: u64, total: u64 },
 }
 
 struct ActiveChannel {
@@ -70,6 +86,7 @@ pub struct Channelizer {
     /// if it is active. None means it's paused (e.g. a real listener
     /// is active).
     idle_refresher: Mutex<Option<u32>>,
+    hd_scan_active: Mutex<bool>,
     /// Serializes `tune` so two simultaneous `?retune=true` requests
     /// can't each enter the retune block and abort each other's task.
     tune_lock: tokio::sync::Mutex<()>,
@@ -85,8 +102,13 @@ impl Channelizer {
             scanned: Mutex::new(Vec::new()),
             metadata: Mutex::new(HashMap::new()),
             idle_refresher: Mutex::new(None),
+            hd_scan_active: Mutex::new(false),
             tune_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    pub fn hd_scan_active(&self) -> bool {
+        *self.hd_scan_active.lock()
     }
 
     pub fn idle_refresher_freq(&self) -> Option<u32> {
@@ -100,11 +122,15 @@ impl Channelizer {
     /// True iff at least one listener is currently subscribed to any
     /// per-station broadcast.
     pub fn any_real_listeners(&self) -> bool {
-        self.active
-            .lock()
-            .map
-            .values()
-            .any(|c| c.tx.receiver_count() > 0)
+        let idle_freq = self.idle_refresher_freq();
+        self.active.lock().map.iter().any(|(&freq, c)| {
+            let listeners = c.tx.receiver_count();
+            if Some(freq) == idle_freq {
+                listeners > 1
+            } else {
+                listeners > 0
+            }
+        })
     }
 
     /// Park the tuner on `freq_hz`, spawn (or reuse) its channel task
@@ -124,6 +150,128 @@ impl Channelizer {
         Ok(())
     }
 
+    /// NRSC-5 HD Radio decode pass.
+    ///
+    /// Two modes, picked automatically based on whether audio is
+    /// already playing on `freq_hz`:
+    ///
+    /// * **Coexist mode** (audio is live on `freq_hz`): does *not*
+    ///   retune or change sample rate.  The audio channel task
+    ///   already dual-spawned an NRSC-5 decoder at `DEFAULT_SAMPLE_RATE`
+    ///   (see [`Self::get_or_spawn`]), so we just dwell, watching the
+    ///   shared metadata slot for album art to surface.
+    ///
+    /// * **Dedicated mode** (no audio anywhere): temporarily switches
+    ///   the RTL-SDR to 1 488 375 S/s centered directly on `freq_hz`
+    ///   (matching the C nrsc5 reference sample rate), runs the
+    ///   NRSC-5 decoder, then restores the previous sample rate and
+    ///   center frequency.  Aborts immediately if any real audio
+    ///   listener connects during the dwell.
+    ///
+    /// Both modes early-exit as soon as `meta_slot.album_art()`
+    /// becomes `Some`, so the API endpoint doesn't make the user wait
+    /// the full `duration` once the art has been decoded.
+    pub async fn refresh_hd_metadata(
+        self: &Arc<Self>,
+        freq_hz: u32,
+        duration: Duration,
+    ) -> Result<(), RtlError> {
+        use crate::nrsc5::consts::NRSC5_RTL_RATE;
+
+        let meta_slot = self.metadata_for(freq_hz);
+        let same_station_audio = self.active_listeners().get(&freq_hz).copied().unwrap_or(0) > 0;
+
+        if same_station_audio {
+            // Coexist with live audio: don't touch the SDR.  The dual-
+            // spawned NRSC-5 task is already chewing the 2.4 MS/s IQ
+            // through the polyphase resampler; just poll the metadata
+            // slot for album art and return when it surfaces.
+            let tick = Duration::from_millis(500);
+            let mut elapsed = Duration::ZERO;
+            while elapsed < duration {
+                if meta_slot.album_art().is_some() {
+                    break;
+                }
+                tokio::time::sleep(tick).await;
+                elapsed += tick;
+            }
+            return Ok(());
+        }
+
+        // Dedicated mode requires us to retune the SDR, so any audio
+        // listener anywhere disqualifies it.  The API layer already
+        // rejects cross-station HD scans during audio; this guard
+        // covers the small race window where a listener attaches
+        // between that check and now.
+        if self.any_real_listeners() {
+            return Ok(());
+        }
+
+        *self.hd_scan_active.lock() = true;
+        self.set_idle_refresher_freq(Some(freq_hz));
+
+        // Save current tuner state so we can restore it afterward.
+        let prev_center = self.center_hz();
+        let prev_rate = DEFAULT_SAMPLE_RATE;
+
+        // Drop any in-flight channel tasks — their DSP assumes 2.4 MS/s.
+        self.drop_all_channels();
+
+        // Switch to dedicated NRSC-5 sample rate and tune to station center.
+        self.rtl.set_sample_rate(NRSC5_RTL_RATE).await?;
+        self.rtl.set_center_freq(freq_hz).await?;
+        let actual_center = self.rtl.state().center_hz;
+        self.set_center(actual_center);
+
+        // Subscribe to the IQ pump (which is now at NRSC5_RTL_RATE).
+        let iq_rx = self.iq_tx.subscribe();
+        // station_hz == center_hz → NCO offset = 0.
+        let hd_task = crate::nrsc5::spawn(
+            iq_rx,
+            meta_slot.clone(),
+            freq_hz,
+            actual_center,
+            NRSC5_RTL_RATE,
+        );
+
+        // Sleep in short intervals so we can abort the moment a real
+        // listener appears (e.g. someone hits play while we're scanning),
+        // or as soon as album art surfaces.
+        let tick = Duration::from_millis(500);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < duration {
+            tokio::time::sleep(tick).await;
+            elapsed += tick;
+            if self.any_real_listeners() {
+                break;
+            }
+            if meta_slot.album_art().is_some() {
+                break;
+            }
+        }
+
+        hd_task.abort();
+
+        if self.any_real_listeners() {
+            // A stream started while the HD scan was running. Do not restore
+            // the old center frequency; tune() has already moved the tuner for
+            // playback. Just make sure audio's expected sample rate is active.
+            self.rtl.set_sample_rate(DEFAULT_SAMPLE_RATE).await.ok();
+            self.set_center(self.rtl.state().center_hz);
+        } else {
+            // No listener interrupted the scan, so put the idle tuner back.
+            self.rtl.set_sample_rate(prev_rate).await.ok();
+            self.rtl.set_center_freq(prev_center).await.ok();
+            let restored = self.rtl.state().center_hz;
+            self.set_center(restored);
+        }
+
+        *self.hd_scan_active.lock() = false;
+        self.set_idle_refresher_freq(None);
+
+        Ok(())
+    }
+
     /// Get-or-create the metadata slot for `freq_hz`. The slot lives
     /// for the lifetime of the Channelizer so a snapshot is still
     /// queryable after the channel task ends.
@@ -137,7 +285,10 @@ impl Channelizer {
     }
 
     pub fn album_art(&self, freq_hz: u32) -> Option<HdAlbumArt> {
-        self.metadata.lock().get(&freq_hz).and_then(|m| m.album_art())
+        self.metadata
+            .lock()
+            .get(&freq_hz)
+            .and_then(|m| m.album_art())
     }
 
     pub fn all_metadata_snapshots(&self) -> HashMap<u32, RdsMetadataDto> {
@@ -161,11 +312,20 @@ impl Channelizer {
     }
 
     pub fn active_listeners(&self) -> HashMap<u32, usize> {
+        let idle_freq = self.idle_refresher_freq();
         self.active
             .lock()
             .map
             .iter()
-            .map(|(k, v)| (*k, v.tx.receiver_count()))
+            .map(|(&freq, v)| {
+                let listeners = v.tx.receiver_count();
+                let real = if Some(freq) == idle_freq {
+                    listeners.saturating_sub(1)
+                } else {
+                    listeners
+                };
+                (freq, real)
+            })
             .collect()
     }
 
@@ -194,6 +354,12 @@ impl Channelizer {
     pub async fn tune(&self, freq_hz: u32) -> Result<broadcast::Receiver<PcmBlock>, RtlError> {
         let _serialize = self.tune_lock.lock().await;
 
+        // Ensure the RTL-SDR is back at the standard wideband rate before
+        // spawning audio tasks (HD scanning temporarily sets 1 488 375 S/s).
+        if self.rtl.state().sample_rate != DEFAULT_SAMPLE_RATE {
+            self.rtl.set_sample_rate(DEFAULT_SAMPLE_RATE).await.ok();
+        }
+
         // Drop any other active channels — only one station plays at a
         // time. Same-freq listeners stay attached via get_or_spawn.
         {
@@ -207,6 +373,7 @@ impl Channelizer {
             for f in &to_drop {
                 if let Some(ch) = active.map.remove(f) {
                     ch.task.abort();
+                    ch.hd_task.abort();
                 }
             }
             if !to_drop.is_empty() {
@@ -245,7 +412,7 @@ impl Channelizer {
             }
         }
 
-        let (tx, rx) = broadcast::channel::<PcmBlock>(64);
+        let (tx, rx) = broadcast::channel::<PcmBlock>(PCM_BROADCAST_BLOCKS);
         let task_tx = tx.clone();
         let iq_rx = self.iq_tx.subscribe();
         let iq_rx_hd = self.iq_tx.subscribe();
@@ -264,8 +431,11 @@ impl Channelizer {
             })
             .await;
         });
-        let hd_task = crate::nrsc5::spawn(iq_rx_hd, meta_slot, freq_hz, center_hz);
-        active.map.insert(freq_hz, ActiveChannel { tx, task, hd_task });
+        let hd_task =
+            crate::nrsc5::spawn(iq_rx_hd, meta_slot, freq_hz, center_hz, DEFAULT_SAMPLE_RATE);
+        active
+            .map
+            .insert(freq_hz, ActiveChannel { tx, task, hd_task });
         rx
     }
 
@@ -297,7 +467,12 @@ impl Channelizer {
     /// Energy-scan the band by retuning across it in 2.4 MHz windows
     /// and FFT-thresholding each window. Replaces the cached channel
     /// list on success.
-    pub async fn scan_band(&self, start_mhz: u32, end_mhz: u32) -> Result<Vec<ScannedChannel>, RtlError> {
+    pub async fn scan_band(
+        &self,
+        start_mhz: u32,
+        end_mhz: u32,
+        mut progress: impl FnMut(ScanProgress),
+    ) -> Result<Vec<ScannedChannel>, RtlError> {
         // Use a fixed mid-high tuner gain during the scan. AGC dynamically
         // backs the gain off when strong signals are present, which in
         // dense FM markets compresses the dynamic range and hides weak
@@ -310,10 +485,13 @@ impl Channelizer {
 
         // Two-pass energy scan with LOs offset by 1 MHz, intersected to
         // remove IQ-imbalance mirrors.
+        progress(ScanProgress::Sweep { done: 0, total: 2 });
         info!("scan pass 1 ({start_mhz}..{end_mhz} MHz, even LOs)");
         let pass_a = self.scan_pass(start_mhz, end_mhz, 0).await?;
+        progress(ScanProgress::Sweep { done: 1, total: 2 });
         info!("scan pass 2 ({start_mhz}..{end_mhz} MHz, odd LOs)");
         let pass_b = self.scan_pass(start_mhz, end_mhz, 1).await?;
+        progress(ScanProgress::Sweep { done: 2, total: 2 });
 
         let candidates = intersect_scans(&pass_a, &pass_b);
         info!(
@@ -329,8 +507,17 @@ impl Channelizer {
         // whether it also has HD/DAB digital sidebands. Mirrors,
         // narrowband telemetry, and most data signals do not have a
         // pilot at exactly 19 kHz in the demodulated MPX.
-        info!("verifying {} candidates via 19 kHz pilot detection", candidates.len());
+        info!(
+            "verifying {} candidates via 19 kHz pilot detection",
+            candidates.len()
+        );
+        let verify_total = candidates.len() as u64;
+        progress(ScanProgress::Verify {
+            done: 0,
+            total: verify_total,
+        });
         let mut found: Vec<ScannedChannel> = Vec::new();
+        let mut verified = 0u64;
         for c in candidates {
             match self.verify_pilot(c.freq_hz).await {
                 Ok(Some(pilot_snr)) => {
@@ -345,15 +532,17 @@ impl Channelizer {
                     });
                 }
                 Ok(None) => {
-                    tracing::debug!(
-                        "verify {} kHz: no pilot → drop",
-                        c.freq_hz / 1000
-                    );
+                    tracing::debug!("verify {} kHz: no pilot → drop", c.freq_hz / 1000);
                 }
                 Err(e) => {
                     warn!("verify {} kHz failed: {e}", c.freq_hz / 1000);
                 }
             }
+            verified += 1;
+            progress(ScanProgress::Verify {
+                done: verified,
+                total: verify_total,
+            });
         }
         found.sort_by_key(|c| c.freq_hz);
         info!("scan: kept {} pilot-verified stations", found.len());
@@ -372,7 +561,7 @@ impl Channelizer {
     /// the noise floor at the surrounding 14-18 kHz band. Returns the
     /// pilot's SNR in dB, or None if no pilot is present.
     async fn verify_pilot(&self, station_hz: u32) -> Result<Option<f32>, RtlError> {
-        use crate::dsp::fir::{ComplexDecimFir, design_lowpass_kaiser};
+        use crate::dsp::fir::{design_lowpass_kaiser, ComplexDecimFir};
         use crate::dsp::fm::FmDemod;
         use crate::dsp::nco::Nco;
         use crate::dsp::u8_iq_to_complex;
@@ -390,8 +579,7 @@ impl Channelizer {
 
         let offset_hz = station_hz as f32 - actual_lo as f32;
         let mut nco = Nco::new(-offset_hz, 2_400_000.0);
-        let mixed: Vec<Complex<f32>> =
-            iq.iter().map(|&z| z * nco.step()).collect();
+        let mixed: Vec<Complex<f32>> = iq.iter().map(|&z| z * nco.step()).collect();
 
         let taps = design_lowpass_kaiser(120_000.0, 2_400_000.0, 127, 9.0);
         let mut ddc = ComplexDecimFir::new(taps, 10);
@@ -423,10 +611,7 @@ impl Channelizer {
         let half = (300.0 / bin_hz).ceil() as usize; // ±300 Hz around 19 kHz
         let pilot_lo = pilot_bin.saturating_sub(half);
         let pilot_hi = (pilot_bin + half).min(n / 2) + 1;
-        let pilot_pow: f32 = buf[pilot_lo..pilot_hi]
-            .iter()
-            .map(|c| c.norm_sqr())
-            .sum();
+        let pilot_pow: f32 = buf[pilot_lo..pilot_hi].iter().map(|c| c.norm_sqr()).sum();
 
         // Reference band: a few hundred Hz around 17.5 kHz, well away
         // from pilot and from the 19 kHz pilot's image bin, and below
@@ -434,10 +619,7 @@ impl Channelizer {
         let ref_bin = (17_500.0 / bin_hz).round() as usize;
         let ref_lo = ref_bin.saturating_sub(half);
         let ref_hi = (ref_bin + half).min(n / 2) + 1;
-        let ref_pow: f32 = buf[ref_lo..ref_hi]
-            .iter()
-            .map(|c| c.norm_sqr())
-            .sum();
+        let ref_pow: f32 = buf[ref_lo..ref_hi].iter().map(|c| c.norm_sqr()).sum();
 
         let pilot_snr_db = 10.0 * (pilot_pow / (ref_pow + 1e-18)).log10();
         // ≥10 dB above the ref band reliably means there is a real
@@ -516,7 +698,10 @@ fn intersect_scans(a: &[ScannedChannel], b: &[ScannedChannel]) -> Vec<ScannedCha
     const TOL_HZ: u32 = 60_000;
     let mut out: Vec<ScannedChannel> = Vec::new();
     for ca in a {
-        if let Some(cb) = b.iter().find(|cb| cb.freq_hz.abs_diff(ca.freq_hz) <= TOL_HZ) {
+        if let Some(cb) = b
+            .iter()
+            .find(|cb| cb.freq_hz.abs_diff(ca.freq_hz) <= TOL_HZ)
+        {
             let avg_freq = ((ca.freq_hz as u64 + cb.freq_hz as u64) / 2) as u32;
             let snapped = ((avg_freq + 500) / 1_000) * 1_000;
             out.push(ScannedChannel {
@@ -670,7 +855,11 @@ fn analyse_window(bytes: &[u8], center_hz: u32) -> Vec<ScannedChannel> {
         if snr < STATION_MIN_SNR_DB {
             continue;
         }
-        let prev = if i == 0 { f32::NEG_INFINITY } else { slot_db[i - 1] };
+        let prev = if i == 0 {
+            f32::NEG_INFINITY
+        } else {
+            slot_db[i - 1]
+        };
         let next = if i + 1 >= slot_db.len() {
             f32::NEG_INFINITY
         } else {

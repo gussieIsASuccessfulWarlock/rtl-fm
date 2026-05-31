@@ -16,8 +16,9 @@
 //! Decoders see a single, coherent native-FLAC stream with sequential
 //! frame numbers (no "sample/frame number mismatch" warnings).
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use flacenc::component::{BitRepr, StreamInfo};
+use flacenc::config::OrderSel;
 use flacenc::error::Verify;
 use flacenc::source::{FrameBuf, MemSource, Source};
 
@@ -25,6 +26,13 @@ use crate::encode::{PCM_BITS, PCM_CHANNELS, PCM_SAMPLE_RATE};
 
 /// FLAC block size. 4096 frames = ~93 ms at 44.1 kHz.
 pub const BLOCK_SIZE: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionProfile {
+    Fast,
+    Balanced,
+    Dense,
+}
 
 pub struct FlacEncoder {
     config: flacenc::error::Verified<flacenc::config::Encoder>,
@@ -36,10 +44,30 @@ pub struct FlacEncoder {
 
 impl FlacEncoder {
     pub fn new() -> Self {
-        let config = flacenc::config::Encoder::default()
+        Self::with_profile(CompressionProfile::Balanced)
+    }
+
+    pub fn with_profile(profile: CompressionProfile) -> Self {
+        let mut config = flacenc::config::Encoder::default();
+        match profile {
+            CompressionProfile::Fast => {
+                config.subframe_coding.use_lpc = false;
+                config.subframe_coding.fixed.max_order = 2;
+                config.subframe_coding.fixed.order_sel = OrderSel::ApproxEnt { partitions: 1 };
+                config.stereo_coding.use_leftside = false;
+                config.stereo_coding.use_rightside = false;
+            }
+            CompressionProfile::Balanced => {}
+            CompressionProfile::Dense => {
+                config.subframe_coding.fixed.order_sel = OrderSel::BitCount;
+                config.subframe_coding.qlpc.lpc_order = 16;
+                config.subframe_coding.prc.max_parameter = 14;
+            }
+        }
+        let config = config
             .into_verified()
             .map_err(|(_, e)| e)
-            .expect("default flacenc encoder config must verify");
+            .expect("FLAC encoder profile config must verify");
         let stream_info = StreamInfo::new(
             PCM_SAMPLE_RATE as usize,
             PCM_CHANNELS as usize,
@@ -94,7 +122,8 @@ impl FlacEncoder {
             .map_err(|e| anyhow!("flacenc frame write: {e:?}"))?;
         let frame_bytes = sink.into_inner();
 
-        let mut out = Vec::with_capacity(if self.header_emitted { 0 } else { 42 } + frame_bytes.len());
+        let mut out =
+            Vec::with_capacity(if self.header_emitted { 0 } else { 42 } + frame_bytes.len());
         if !self.header_emitted {
             out.extend_from_slice(&build_stream_header());
             self.header_emitted = true;

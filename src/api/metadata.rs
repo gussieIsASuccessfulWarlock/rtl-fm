@@ -14,11 +14,11 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::time::Duration;
 
-use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::IntoResponse;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::IntoResponse;
+use axum::Json;
 use futures_util::Stream;
 use serde::Serialize;
 
@@ -36,6 +36,7 @@ pub struct StationInfo {
     pub name: String,
     pub scan_power_db: f32,
     pub listeners: usize,
+    pub votes: usize,
     pub metadata: Option<RdsMetadataDto>,
 }
 
@@ -46,7 +47,56 @@ pub struct StationsResponse {
     pub window_lo_hz: u32,
     pub window_hi_hz: u32,
     pub idle_refresher_freq_hz: Option<u32>,
+    pub winner_hz: Option<u32>,
+    pub active_voters: usize,
     pub stations: Vec<StationInfo>,
+}
+
+/// Site/operator metadata for `GET /meta`.
+#[derive(Debug, Serialize)]
+pub struct MetaResponse {
+    /// Software version (Cargo package version).
+    pub version: &'static str,
+    pub owner: String,
+    pub location: String,
+    /// Number of scanned channels in the band.
+    pub channels: usize,
+    /// Mean per-station signal quality in dB (live decode SNR where
+    /// available, otherwise the scan power), rounded to 0.1 dB.
+    pub average_quality_db: f32,
+    /// Distinct listeners (voted or streamed) in the last 24 hours.
+    pub daily_listeners: usize,
+    /// Anonymous public sessions seen in the last hour.
+    pub active_sessions: usize,
+}
+
+pub async fn meta(State(state): State<AppState>) -> Json<MetaResponse> {
+    let snap = build_stations(&state);
+    let channels = snap.stations.len();
+    let average_quality_db = if channels == 0 {
+        0.0
+    } else {
+        let sum: f32 = snap
+            .stations
+            .iter()
+            .map(|s| {
+                s.metadata
+                    .as_ref()
+                    .and_then(|m| m.signal_snr_db)
+                    .unwrap_or(s.scan_power_db)
+            })
+            .sum();
+        ((sum / channels as f32) * 10.0).round() / 10.0
+    };
+    Json(MetaResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        owner: state.owner.clone(),
+        location: state.location.clone(),
+        channels,
+        average_quality_db,
+        daily_listeners: state.votes.daily_listeners(),
+        active_sessions: state.sessions.active(Duration::from_secs(3600)),
+    })
 }
 
 pub async fn all(State(state): State<AppState>) -> Json<AllMetadataResponse> {
@@ -71,6 +121,44 @@ pub async fn one(
                 freq_hz / 1000
             ),
         )),
+    }
+}
+
+pub async fn hd_scan(
+    Path(khz): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<RdsMetadataDto>, (StatusCode, String)> {
+    let Some(freq_hz) = parse_freq_hz(&khz) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid frequency".to_string()));
+    };
+
+    // Same-station HD-while-audio is allowed — the channel task already
+    // dual-spawned an NRSC-5 decoder at 2.4 MS/s.  Cross-station is
+    // rejected because honouring it would force the SDR off the audio
+    // station and break the live stream.
+    let listeners = state.channelizer.active_listeners();
+    let here = listeners.get(&freq_hz).copied().unwrap_or(0);
+    let elsewhere: usize = listeners
+        .iter()
+        .filter(|(&f, _)| f != freq_hz)
+        .map(|(_, &n)| n)
+        .sum();
+    if here == 0 && elsewhere > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            "another station is currently playing; stop it before scanning HD here".to_string(),
+        ));
+    }
+
+    state
+        .channelizer
+        .refresh_hd_metadata(freq_hz, Duration::from_secs(75))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    match state.channelizer.metadata_snapshot(freq_hz) {
+        Some(m) => Ok(Json(m)),
+        None => Err((StatusCode::NOT_FOUND, "no metadata cached yet".to_string())),
     }
 }
 
@@ -142,6 +230,12 @@ fn build_stations(state: &AppState) -> StationsResponse {
     let scanned: Vec<ScannedChannel> = state.channelizer.scanned();
     let metas = state.channelizer.all_metadata_snapshots();
     let listeners = state.channelizer.active_listeners();
+    let vote_snap = state.votes.snapshot();
+    let vote_counts: std::collections::HashMap<u32, usize> = vote_snap
+        .tallies
+        .iter()
+        .map(|t| (t.freq_hz, t.votes))
+        .collect();
     let stations: Vec<StationInfo> = scanned
         .into_iter()
         .map(|c| StationInfo {
@@ -149,6 +243,7 @@ fn build_stations(state: &AppState) -> StationsResponse {
             name: c.name,
             scan_power_db: c.power_db,
             listeners: listeners.get(&c.freq_hz).copied().unwrap_or(0),
+            votes: vote_counts.get(&c.freq_hz).copied().unwrap_or(0),
             metadata: metas.get(&c.freq_hz).cloned(),
         })
         .collect();
@@ -160,6 +255,8 @@ fn build_stations(state: &AppState) -> StationsResponse {
         window_lo_hz: lo,
         window_hi_hz: hi,
         idle_refresher_freq_hz: state.channelizer.idle_refresher_freq(),
+        winner_hz: vote_snap.winner_hz,
+        active_voters: vote_snap.active_voters,
         stations,
     }
 }

@@ -1,17 +1,15 @@
 //! Streaming WAV writer (debug endpoint).
 //!
 //! Emits a RIFF header with a "huge" data-size so browsers/players
-//! treat the stream as open-ended. Body is 24-bit little-endian
-//! signed interleaved stereo at 44.1 kHz.
+//! treat the stream as open-ended. Body is little-endian signed
+//! interleaved stereo PCM.
 
-use crate::encode::{PCM_BITS, PCM_CHANNELS, PCM_SAMPLE_RATE};
+use crate::encode::PCM_CHANNELS;
 
 /// Build the WAV header. `data_size` is a fake huge value used so
 /// that the WAV header reads as a near-infinite stream.
-pub fn header() -> Vec<u8> {
-    let sample_rate = PCM_SAMPLE_RATE;
+pub fn header(bits: u16, sample_rate: u32) -> Vec<u8> {
     let channels = PCM_CHANNELS;
-    let bits = PCM_BITS;
     let block_align: u16 = channels * (bits / 8);
     let byte_rate = sample_rate * u32::from(block_align);
     // Fake data size: large but valid; reserve room so the RIFF total
@@ -38,12 +36,18 @@ pub fn header() -> Vec<u8> {
 
 /// Encode a slice of i32 samples (lower 24 bits significant, sign-
 /// extended) to 24-bit little-endian PCM bytes.
-pub fn encode_block(samples: &[i32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(samples.len() * 3);
+pub fn encode_block(samples: &[i32], bits: u16) -> Vec<u8> {
+    let bytes_per_sample = usize::from(bits / 8);
+    let mut out = Vec::with_capacity(samples.len() * bytes_per_sample);
     for &s in samples {
         let s = s.clamp(-(1 << 23), (1 << 23) - 1);
-        let b = s.to_le_bytes();
-        out.extend_from_slice(&b[0..3]);
+        if bits == 16 {
+            let s16 = (s >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            out.extend_from_slice(&s16.to_le_bytes());
+        } else {
+            let b = s.to_le_bytes();
+            out.extend_from_slice(&b[0..3]);
+        }
     }
     out
 }

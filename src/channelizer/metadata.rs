@@ -17,6 +17,7 @@ pub struct StationMetadataInner {
     pub rds: RdsMetadata,
     pub hd: HdMetadataDto,
     pub hd_album_art: Option<HdAlbumArt>,
+    pub signal_snr_db: Option<f32>,
     pub last_update: Option<SystemTime>,
     pub first_decoded_at: Option<SystemTime>,
 }
@@ -26,13 +27,16 @@ impl StationMetadata {
         Self(Arc::new(Mutex::new(StationMetadataInner::default())))
     }
 
-    pub fn update_rds(&self, rds: RdsMetadata) {
+    pub fn update_rds(&self, rds: RdsMetadata, signal_snr_db: Option<f32>) {
         let mut g = self.0.lock();
         if g.first_decoded_at.is_none() {
             g.first_decoded_at = Some(SystemTime::now());
         }
         g.last_update = Some(SystemTime::now());
         g.rds = rds;
+        if signal_snr_db.is_some() {
+            g.signal_snr_db = signal_snr_db;
+        }
     }
 
     pub fn update_hd(&self, hd: HdMetadataDto) {
@@ -86,6 +90,7 @@ impl StationMetadata {
             music: rds.ms_music,
             groups_decoded: rds.groups_decoded,
             blocks_dropped: rds.blocks_dropped,
+            signal_snr_db: g.signal_snr_db,
             hd: Some(g.hd.clone()).filter(|hd| hd.has_data()),
             last_update_unix: g.last_update.and_then(|t| {
                 t.duration_since(SystemTime::UNIX_EPOCH)
@@ -115,6 +120,7 @@ pub struct RdsMetadataDto {
     pub music: bool,
     pub groups_decoded: u64,
     pub blocks_dropped: u64,
+    pub signal_snr_db: Option<f32>,
     pub hd: Option<HdMetadataDto>,
     pub last_update_unix: Option<u64>,
     pub first_decoded_at_unix: Option<u64>,

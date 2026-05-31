@@ -1,74 +1,96 @@
-//! Channel equalization and soft demapping for NRSC-5.
-
-use std::sync::LazyLock;
+//! Channel equalization + soft QPSK demap for NRSC-5 P1 data.
+//!
+//! For each partition, linearly interpolate the channel estimate
+//! between the lower and upper reference (matching sync.c's
+//! `(19+19j) / (k*smag19*upper + (19-k)*smag0*lower)` equalizer), then
+//! divide the data sample by the interpolated channel and rotate by
+//! +45° so the on-axis QPSK constellation lands on the C reference's
+//! real/imaginary soft-decision axes.
+//! Per data carrier we emit two i8 LLRs (real then imag), giving 360
+//! carriers × 2 bits = 720 soft bits per OFDM symbol in the order the
+//! PM interleaver expects.
 
 use num_complex::Complex;
 
-use crate::nrsc5::consts::{OFDM_FFT_LEN, REF_SUBCARRIERS};
+use crate::nrsc5::consts::{LB_START, PARTITION_WIDTH_FM, PM_PARTITIONS, UB_END};
 
-/// Soft demap QPSK symbol to two 8-bit LLRs (0..255, 128 = erasure).
-pub fn soft_demap_qpsk(z: Complex<f32>) -> (u8, u8) {
-    let scale = 90.0f32;
-    let i = 127.5 + z.re * scale;
-    let q = 127.5 + z.im * scale;
-    (i.clamp(0.0, 255.0) as u8, q.clamp(0.0, 255.0) as u8)
-}
-
-/// All P1 data subcarrier indices (signed, 0-centered) for FM Hybrid mode.
-pub static P1_DATA_SC: LazyLock<Vec<i16>> = LazyLock::new(|| {
-    let ref_set: std::collections::HashSet<i16> = REF_SUBCARRIERS.iter().copied().collect();
-    let mut sc = Vec::new();
-    for s in -1092i16..=-225 {
-        if !ref_set.contains(&s) {
-            sc.push(s);
-        }
-    }
-    for s in 225..=1092 {
-        if !ref_set.contains(&s) {
-            sc.push(s);
-        }
-    }
-    sc
-});
-
-fn bin_idx(sc: i16) -> usize {
-    if sc >= 0 { sc as usize } else { (OFDM_FFT_LEN as i16 + sc) as usize }
-}
-
-/// Equalize data subcarriers and produce soft bits for one symbol.
 pub fn equalize_and_demap(
     fft_bins: &[Complex<f32>],
-    ref_estimates: &[Complex<f32>],
-    data_sc: &[i16],
-    out_soft: &mut Vec<u8>,
+    ref_est: &[Complex<f32>],
+    bin_offset: i32,
+    out_soft: &mut Vec<i8>,
 ) {
-    for &sc in data_sc {
-        let idx = bin_idx(sc);
-        if idx >= fft_bins.len() {
-            continue;
-        }
-        let z = fft_bins[idx];
-        let ch = interpolate_channel(sc, ref_estimates);
-        let w = ch.norm_sqr().max(1e-10);
-        let eq = Complex::new(
-            (ch.re * z.re + ch.im * z.im) / w,
-            (ch.re * z.im - ch.im * z.re) / w,
+    let pw = PARTITION_WIDTH_FM;
+    // LB partitions p=0..9: lower ref at REF_BINS_FM[p], upper at p+1.
+    for p in 0..PM_PARTITIONS {
+        let lower_ref = ref_est[p];
+        let upper_ref = ref_est[p + 1];
+        let lower_bin = LB_START + p * pw;
+        emit_partition(
+            fft_bins, lower_bin, lower_ref, upper_ref, bin_offset, out_soft,
         );
-        let (si, sq) = soft_demap_qpsk(eq);
-        out_soft.push(si);
-        out_soft.push(sq);
+    }
+    // UB partitions p=0..9: lower ref at REF_BINS_FM[21-p], upper at 20-p,
+    // partition starts at bin UB_END - (10-p)*pw.
+    for p in 0..PM_PARTITIONS {
+        let lower_ref = ref_est[21 - p];
+        let upper_ref = ref_est[20 - p];
+        let lower_bin = UB_END - (PM_PARTITIONS - p) * pw;
+        emit_partition(
+            fft_bins, lower_bin, lower_ref, upper_ref, bin_offset, out_soft,
+        );
     }
 }
 
-fn interpolate_channel(sc: i16, ref_est: &[Complex<f32>]) -> Complex<f32> {
-    let mut best_d = i16::MAX;
-    let mut best = Complex::new(1.0, 0.0);
-    for (&rs, &ch) in REF_SUBCARRIERS.iter().zip(ref_est.iter()) {
-        let d = (sc - rs).abs();
-        if d < best_d {
-            best_d = d;
-            best = ch;
+fn emit_partition(
+    fft_bins: &[Complex<f32>],
+    lower_bin: usize,
+    lower_ref: Complex<f32>,
+    upper_ref: Complex<f32>,
+    bin_offset: i32,
+    out_soft: &mut Vec<i8>,
+) {
+    let pw = PARTITION_WIDTH_FM;
+    let p_f = pw as f32;
+    for k in 1..pw {
+        let bin = lower_bin + k;
+        let Some(bin) = shifted_bin(bin, bin_offset, fft_bins.len()) else {
+            out_soft.push(0);
+            out_soft.push(0);
+            continue;
+        };
+        if bin >= fft_bins.len() {
+            out_soft.push(0);
+            out_soft.push(0);
+            continue;
         }
+        let z = fft_bins[bin];
+        let k_f = k as f32;
+        // Linear-interpolated channel estimate at this carrier
+        // (normalized by partition width so |ch| ≈ |channel|, not 19×).
+        let ch = Complex::new(
+            (k_f * upper_ref.re + (p_f - k_f) * lower_ref.re) / p_f,
+            (k_f * upper_ref.im + (p_f - k_f) * lower_ref.im) / p_f,
+        );
+        let w = ch.norm_sqr().max(1e-10);
+        // eq = z / ch
+        let eq_re = (z.re * ch.re + z.im * ch.im) / w;
+        let eq_im = (z.im * ch.re - z.re * ch.im) / w;
+        // +45° rotation: multiply by (1+j), matching sync.c's
+        // `(19+19i) / (...)` equalizer factor.
+        let rot_re = eq_re - eq_im;
+        let rot_im = eq_re + eq_im;
+        let scale = 64.0f32;
+        out_soft.push((rot_re * scale).clamp(-127.0, 127.0) as i8);
+        out_soft.push((rot_im * scale).clamp(-127.0, 127.0) as i8);
     }
-    best
+}
+
+fn shifted_bin(bin: usize, offset: i32, len: usize) -> Option<usize> {
+    let shifted = bin as i32 + offset;
+    if shifted < 0 || shifted >= len as i32 {
+        None
+    } else {
+        Some(shifted as usize)
+    }
 }

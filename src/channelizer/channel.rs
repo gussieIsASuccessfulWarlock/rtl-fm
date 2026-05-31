@@ -4,14 +4,14 @@
 use std::sync::Arc;
 
 use num_complex::Complex;
+use rand::rngs::SmallRng;
 use rand::Rng;
 use rand::SeedableRng;
-use rand::rngs::SmallRng;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::channelizer::metadata::StationMetadata;
-use crate::dsp::fir::{ComplexDecimFir, RealFir, design_lowpass_kaiser};
+use crate::dsp::fir::{design_lowpass_kaiser, ComplexDecimFir, RealFir};
 use crate::dsp::fm::FmDemod;
 use crate::dsp::iir::{Deemphasis, TAU_50US};
 use crate::dsp::nco::Nco;
@@ -58,6 +58,33 @@ fn bandpass_19khz(fs: f32) -> Vec<f32> {
         bp.push(2.0 * h * (omega * kk).cos());
     }
     bp
+}
+
+fn tone_power(samples: &[f32], fs: f32, freq_hz: f32) -> f32 {
+    let n = samples.len() as f32;
+    let omega = 2.0 * std::f32::consts::PI * freq_hz / fs;
+    let coeff = 2.0 * omega.cos();
+    let mut q0;
+    let mut q1 = 0.0f32;
+    let mut q2 = 0.0f32;
+
+    for (i, &sample) in samples.iter().enumerate() {
+        let w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n).cos());
+        q0 = sample * w + coeff * q1 - q2;
+        q2 = q1;
+        q1 = q0;
+    }
+
+    q1 * q1 + q2 * q2 - coeff * q1 * q2
+}
+
+fn estimate_pilot_snr_db(mpx: &[f32]) -> Option<f32> {
+    if mpx.len() < 512 {
+        return None;
+    }
+    let pilot_pow = tone_power(mpx, BASEBAND_RATE, 19_000.0);
+    let ref_pow = tone_power(mpx, BASEBAND_RATE, 17_500.0);
+    Some(10.0 * (pilot_pow / (ref_pow + 1e-18)).log10())
 }
 
 pub async fn run(mut task: ChannelTask) {
@@ -171,7 +198,7 @@ pub async fn run(mut task: ChannelTask) {
             } else {
                 rds_decoder_a.meta.clone()
             };
-            task.metadata.update_rds(meta);
+            task.metadata.update_rds(meta, estimate_pilot_snr_db(&mpx));
         }
 
         // Per-channel deemphasis (interleaved L,R).
@@ -205,5 +232,5 @@ pub async fn run(mut task: ChannelTask) {
         Some(1) => rds_decoder_b.meta.clone(),
         _ => rds_decoder_a.meta.clone(),
     };
-    task.metadata.update_rds(final_meta);
+    task.metadata.update_rds(final_meta, None);
 }

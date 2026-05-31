@@ -28,6 +28,7 @@ parking_lot = "0.12"
 rand = { version = "0.8", features = ["small_rng"] }
 rustfft = "6"
 async-stream = "0.3"
+indicatif = "0.17"
 
 [profile.release]
 opt-level = 3

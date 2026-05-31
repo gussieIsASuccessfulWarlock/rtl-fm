@@ -71,7 +71,7 @@ pub async fn rescan(
     let (lo, hi) = state.scan_band_mhz;
     state
         .channelizer
-        .scan_band(lo, hi)
+        .scan_band(lo, hi, |_| {})
         .await
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))

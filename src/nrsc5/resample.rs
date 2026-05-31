@@ -1,79 +1,167 @@
-//! Complex rational resampler for the NRSC-5 chain.
+//! NRSC-5 sample-rate conversion.
+//!
+//! Two modes:
+//!
+//! 1. **Wideband (legacy)**: 2.4 MS/s RTL-SDR → 744 187.5 S/s.
+//!    Rational polyphase resampler INTERP/DECIM = 3969/12800.
+//!    (Not the primary path — kept for reference.)
+//!
+//! 2. **Dedicated (preferred)**: 1 488 375 S/s RTL-SDR → 744 187.5 S/s.
+//!    Simple decimate-by-2 with a 63-tap Kaiser anti-alias filter.
+//!    This is how the C nrsc5 reference operates; tuning the RTL-SDR
+//!    directly onto the target station at 1.488 MS/s ensures the NRSC-5
+//!    IBOC sidebands receive full 8-bit ADC dynamic range, with the
+//!    dominant analog-FM carrier occupying the correct portion of the
+//!    ADC range rather than multiple wideband stations competing for it.
 
 use num_complex::Complex;
 
-use crate::nrsc5::consts::{RESAMPLE_DECIM, RESAMPLE_INTERP};
+use crate::dsp::fir::design_lowpass_kaiser;
+use crate::nrsc5::consts::{NRSC5_IQ_RATE, RESAMPLE_DECIM, RESAMPLE_INTERP, RTL_IQ_RATE};
 
-/// Windowed-sinc lowpass used by the polyphase converter.
-fn design_resample_taps() -> Vec<f32> {
-    let phases = RESAMPLE_INTERP;
-    let taps_per_phase = 32usize;
-    let ntaps = phases * taps_per_phase;
-    let cutoff = 0.5f32 / (RESAMPLE_INTERP.max(RESAMPLE_DECIM) as f32);
-    let mid = (ntaps as f32 - 1.0) * 0.5;
-    let mut taps = Vec::with_capacity(ntaps);
-    for n in 0..ntaps {
-        let x = n as f32 - mid;
-        let sinc = if x.abs() < 1e-8 {
-            2.0 * cutoff
-        } else {
-            (2.0 * std::f32::consts::PI * cutoff * x).sin() / (std::f32::consts::PI * x)
-        };
-        let win = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / (ntaps as f32 - 1.0)).cos();
-        taps.push(sinc * win * RESAMPLE_INTERP as f32);
-    }
-    taps
-}
+// ── Wideband (polyphase) resampler ───────────────────────────────────────────
 
-/// Stateful rational complex resampler.
+/// Number of taps per polyphase branch. Runtime cost is this many complex
+/// MACs per output sample; the large interpolation factor only increases
+/// the precomputed branch table.
+const TAPS_PER_ARM: usize = 16;
+const FILTER_LEN: usize = RESAMPLE_INTERP * TAPS_PER_ARM;
+
 pub struct ComplexResampler {
-    taps: Vec<f32>,
-    hist: Vec<Complex<f32>>,
-    phase: usize,
-    in_idx: usize,
-    taps_per_phase: usize,
+    branches: Vec<Vec<f32>>,
+    /// Delay line, newest-first: `delay[0]` is the most recent input.
+    delay: Vec<Complex<f32>>,
+    n_in: u64,
+    m_out: u64,
 }
 
 impl ComplexResampler {
     pub fn new() -> Self {
-        let taps = design_resample_taps();
-        let taps_per_phase = taps.len() / RESAMPLE_INTERP;
+        // Design the prototype at the upsampled rate (fs_in × INTERP),
+        // cut just below output Nyquist, scale by INTERP to compensate
+        // upsample zero-stuffing.
+        let fs_up = RTL_IQ_RATE * RESAMPLE_INTERP as f32;
+        let cutoff = NRSC5_IQ_RATE * 0.45;
+        let mut taps = design_lowpass_kaiser(cutoff, fs_up, FILTER_LEN, 9.0);
+        let scale = RESAMPLE_INTERP as f32;
+        for t in taps.iter_mut() {
+            *t *= scale;
+        }
+
+        let mut branches: Vec<Vec<f32>> = (0..RESAMPLE_INTERP)
+            .map(|_| Vec::with_capacity(TAPS_PER_ARM))
+            .collect();
+        // Polyphase decomposition: tap i goes to branch (i mod INTERP).
+        for (i, t) in taps.into_iter().enumerate() {
+            branches[i % RESAMPLE_INTERP].push(t);
+        }
+
         Self {
-            taps,
-            hist: Vec::with_capacity(8192),
-            phase: 0,
-            in_idx: 0,
-            taps_per_phase,
+            branches,
+            delay: vec![Complex::new(0.0, 0.0); TAPS_PER_ARM],
+            n_in: 0,
+            m_out: 0,
         }
     }
 
-    pub fn process(&mut self, input: &[Complex<f32>], out: &mut Vec<Complex<f32>>) {
-        self.hist.extend_from_slice(input);
-        while self.in_idx + self.taps_per_phase <= self.hist.len() {
-            let mut acc = Complex::<f32>::new(0.0, 0.0);
-            let phase_taps = &self.taps[self.phase..];
-            for k in 0..self.taps_per_phase {
-                let x = self.hist[self.in_idx + self.taps_per_phase - 1 - k];
-                let h = phase_taps[k * RESAMPLE_INTERP];
-                acc += x * h;
+    pub fn process(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
+        for &x in input {
+            // Push input into the newest-first delay line.
+            for k in (1..TAPS_PER_ARM).rev() {
+                self.delay[k] = self.delay[k - 1];
             }
-            out.push(acc);
+            self.delay[0] = x;
+            self.n_in += 1;
 
-            self.phase += RESAMPLE_DECIM;
-            let adv = self.phase / RESAMPLE_INTERP;
-            self.phase %= RESAMPLE_INTERP;
-            self.in_idx += adv;
-        }
+            // Emit any outputs whose anchor input has now arrived.
+            loop {
+                let m_decim = self.m_out * RESAMPLE_DECIM as u64;
+                let anchor = m_decim / RESAMPLE_INTERP as u64;
+                if anchor + 1 > self.n_in {
+                    break;
+                }
+                let branch = (m_decim % RESAMPLE_INTERP as u64) as usize;
+                let taps = &self.branches[branch];
+                let offset = (self.n_in - 1 - anchor) as usize;
 
-        let keep_from = self.in_idx.saturating_sub(self.taps_per_phase);
-        if keep_from > 0 {
-            self.hist.drain(..keep_from);
-            self.in_idx -= keep_from;
+                let mut acc_re = 0.0f32;
+                let mut acc_im = 0.0f32;
+                for (j, &t) in taps.iter().enumerate() {
+                    let k = offset + j;
+                    if k < self.delay.len() {
+                        acc_re += self.delay[k].re * t;
+                        acc_im += self.delay[k].im * t;
+                    }
+                }
+                output.push(Complex::new(acc_re, acc_im));
+                self.m_out += 1;
+            }
         }
     }
 }
 
 impl Default for ComplexResampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Dedicated 1 488 375 → 744 187.5 S/s decimator ───────────────────────────
+
+/// Number of taps for the halfband anti-alias filter.
+const HALFBAND_TAPS: usize = 63;
+
+/// Decimate-by-2 lowpass FIR for the dedicated NRSC-5 path.
+///
+/// Input: 1 488 375 S/s (RTL-SDR centered directly on target station).
+/// Output: 744 187.5 S/s (NRSC-5 processing rate).
+///
+/// Cutoff is set to 0.45 × 744 187.5 = ~335 kHz, well within the
+/// NRSC-5 IBOC sideband extent (~400 kHz) but rejecting out-of-band
+/// interference from adjacent FM stations.
+pub struct HalfbandDecimator {
+    taps: Vec<f32>,
+    /// Circular delay line (length = HALFBAND_TAPS).
+    delay: Vec<Complex<f32>>,
+    head: usize,
+    /// Toggles each input sample; output produced when phase == 0.
+    phase: usize,
+}
+
+impl HalfbandDecimator {
+    pub fn new() -> Self {
+        // fs_in = 1 488 375, cutoff = 0.45 × 744 187.5 = 334 884 Hz.
+        let taps = design_lowpass_kaiser(334_884.0, 1_488_375.0, HALFBAND_TAPS, 9.0);
+        Self {
+            taps,
+            delay: vec![Complex::new(0.0, 0.0); HALFBAND_TAPS],
+            head: 0,
+            phase: 0,
+        }
+    }
+
+    pub fn process(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
+        for &x in input {
+            // Insert into circular delay line.
+            self.delay[self.head] = x;
+            self.head = (self.head + 1) % HALFBAND_TAPS;
+
+            // Emit one output every two inputs.
+            if self.phase == 0 {
+                let mut acc = Complex::new(0.0f32, 0.0f32);
+                for (i, &t) in self.taps.iter().enumerate() {
+                    let idx = (self.head + HALFBAND_TAPS - 1 - i) % HALFBAND_TAPS;
+                    acc.re += self.delay[idx].re * t;
+                    acc.im += self.delay[idx].im * t;
+                }
+                output.push(acc);
+            }
+            self.phase ^= 1;
+        }
+    }
+}
+
+impl Default for HalfbandDecimator {
     fn default() -> Self {
         Self::new()
     }

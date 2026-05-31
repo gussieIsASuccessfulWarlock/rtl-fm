@@ -1,208 +1,149 @@
-//! Rate-5/8 Viterbi decoder for NRSC-5 P1 logical channel.
+//! Viterbi convolutional decoder for NRSC-5 P1 / PIDS streams.
 //!
-//! Tables are generated following the Theori C implementation's
-//! LFSR-based convolution; clippy's style lints are suppressed so the
-//! structure stays readable against the reference.
+//! Rate-1/3 K=7 code with generators (0o133, 0o171, 0o165) and
+//! tail-biting termination. Re-implements the same algorithm as the C
+//! reference (`conv_dec.c`): right-shift state convention, 32-state
+//! ACS butterfly that exploits LSB-odd generators to negate the branch
+//! metric between sibling predecessors, and the proper tail-biting
+//! pre-roll / post-roll wrapping (32 extra trellis steps on each end,
+//! cyclic over the input).
 
-#![allow(clippy::needless_range_loop, clippy::collapsible_if)]
+use crate::nrsc5::consts::{CONV_K7, CONV_K7_GEN};
 
-use std::sync::LazyLock;
-
-use crate::nrsc5::consts::{VITERBI_GEN, VITERBI_INPUTS, VITERBI_NUMS};
-
-/// Precomputed tables: for each state (0..63) and each 5-bit input (0..31),
-/// output[state][input] = 8-bit expected output word,
-/// next_state[state][input] = next trellis state.
-static OUTPUT_TABLE: LazyLock<[[u8; VITERBI_INPUTS]; VITERBI_NUMS]> = LazyLock::new(|| {
-    let mut out_tab = [[0u8; VITERBI_INPUTS]; VITERBI_NUMS];
-    let mut nxt_tab = [[0u8; VITERBI_INPUTS]; VITERBI_NUMS];
-
-    // Generate init permutation using LFSR: x^6 + x^5 + x^2 + 1
-    let mut init = [0u32; VITERBI_NUMS];
-    let mut shift_reg = 0u32;
-    for i in 0..VITERBI_NUMS {
-        init[i] = shift_reg;
-        shift_reg = shift_reg << 1
-            | ((shift_reg >> 5) ^ (shift_reg >> 2) ^ shift_reg) & 1;
-    }
-
-    for state in 0..VITERBI_NUMS {
-        for inp in 0..VITERBI_INPUTS {
-            // Compute output bits
-            let mut b = 0u8;
-            let shift = ((init[state] << 5) | inp as u32) as u16;
-            for k in 0..8 {
-                b = (b << 1) | ((shift & VITERBI_GEN[k] as u16).count_ones() as u8 & 1);
-            }
-            out_tab[state][inp] = b;
-
-            // Compute next state
-            let mut s = init[state];
-            for k in 0..5 {
-                s = (s << 1) | (((inp >> (4 - k)) & 1) as u32);
-            }
-            nxt_tab[state][inp] = (s & (VITERBI_NUMS as u32 - 1)) as u8;
-        }
-    }
-
-    out_tab
-});
-
-static NXT_TABLE: LazyLock<[[u8; VITERBI_INPUTS]; VITERBI_NUMS]> = LazyLock::new(|| {
-    let mut out_tab = [[0u8; VITERBI_INPUTS]; VITERBI_NUMS];
-    let mut nxt_tab = [[0u8; VITERBI_INPUTS]; VITERBI_NUMS];
-
-    let mut init = [0u32; VITERBI_NUMS];
-    let mut shift_reg = 0u32;
-    for i in 0..VITERBI_NUMS {
-        init[i] = shift_reg;
-        shift_reg = shift_reg << 1
-            | ((shift_reg >> 5) ^ (shift_reg >> 2) ^ shift_reg) & 1;
-    }
-
-    for state in 0..VITERBI_NUMS {
-        for inp in 0..VITERBI_INPUTS {
-            let mut b = 0u8;
-            let shift = ((init[state] << 5) | inp as u32) as u16;
-            for k in 0..8 {
-                b = (b << 1) | ((shift & VITERBI_GEN[k] as u16).count_ones() as u8 & 1);
-            }
-            out_tab[state][inp] = b;
-
-            let mut s = init[state];
-            for k in 0..5 {
-                s = (s << 1) | (((inp >> (4 - k)) & 1) as u32);
-            }
-            nxt_tab[state][inp] = (s & (VITERBI_NUMS as u32 - 1)) as u8;
-        }
-    }
-
-    nxt_tab
-});
+const STATES: usize = 1 << (CONV_K7 - 1); // 64
+const HALF: usize = STATES / 2; // 32
+const EXTRA: usize = 32; // TAIL_BITING_EXTRA, matches conv_dec.c
 
 pub struct Viterbi {
-    path_metrics: [i32; VITERBI_NUMS],
-    traceback: Vec<[u8; VITERBI_NUMS]>, // best previous state for each state at each step
-    out_buf: Vec<u8>,
+    metrics: Vec<i32>,
+    new_metrics: Vec<i32>,
+    traceback: Vec<[u8; STATES]>,
 }
 
 impl Viterbi {
     pub fn new() -> Self {
-        let mut pm = [0i32; VITERBI_NUMS];
-        pm[0] = 0;
-        for i in 1..VITERBI_NUMS {
-            pm[i] = i32::MIN / 2;
-        }
         Self {
-            path_metrics: pm,
-            traceback: Vec::with_capacity(1024),
-            out_buf: Vec::with_capacity(4096),
+            metrics: vec![0; STATES],
+            new_metrics: vec![0; STATES],
+            traceback: Vec::new(),
         }
     }
 
-    /// Decode soft bits (0..255, 128 = erasure).
-    /// Returns decoded bytes (5 bits packed per step → groups, output bytes).
-    pub fn decode(&mut self, soft_bits: &[u8]) -> &[u8] {
-        let out_tab = &*OUTPUT_TABLE;
-        let nxt_tab = &*NXT_TABLE;
+    /// Decode `frame_len` bits from `depunctured` (rate-1/3 soft bits,
+    /// 3 entries per trellis step). Output is written into `decoded`.
+    pub fn decode(&mut self, depunctured: &[i8], decoded: &mut Vec<u8>, frame_len: usize) {
+        decoded.clear();
+        decoded.resize(frame_len, 0);
+        if depunctured.len() < frame_len * 3 {
+            return;
+        }
 
-        let steps = soft_bits.len() / 8;
+        let total = frame_len + 2 * EXTRA;
         self.traceback.clear();
-        self.traceback.reserve(steps);
+        self.traceback.resize(total, [0u8; STATES]);
+        self.metrics.fill(0);
 
-        let mut pm = [i32::MIN / 2; VITERBI_NUMS];
-        pm[0] = 0;
-
-        let mut tb_step: [u8; VITERBI_NUMS] = [0; VITERBI_NUMS];
-
-        for step in 0..steps {
-            let base = step * 8;
-            let rx0 = soft_bits[base] as i32;
-            let rx1 = soft_bits[base + 1] as i32;
-            let rx2 = soft_bits[base + 2] as i32;
-            let rx3 = soft_bits[base + 3] as i32;
-            let rx4 = soft_bits[base + 4] as i32;
-            let rx5 = soft_bits[base + 5] as i32;
-            let rx6 = soft_bits[base + 6] as i32;
-            let rx7 = soft_bits[base + 7] as i32;
-            let rx = [rx0, rx1, rx2, rx3, rx4, rx5, rx6, rx7];
-
-            let mut new_pm = [i32::MIN / 2; VITERBI_NUMS];
-
-            for state in 0..VITERBI_NUMS {
-                let cur_pm = pm[state];
-                if cur_pm < i32::MIN / 4 {
-                    continue;
-                }
-                for inp in 0..VITERBI_INPUTS {
-                    let exp = out_tab[state][inp];
-                    let ns = nxt_tab[state][inp] as usize;
-
-                    let mut bm = 0i32;
-                    for bit in 0..8 {
-                        let ebit = ((exp >> (7 - bit)) & 1) as i32;
-                        bm += if ebit == 1 { rx[bit] } else { 255 - rx[bit] };
-                    }
-
-                    let cand = cur_pm + bm;
-                    if cand > new_pm[ns] {
-                        new_pm[ns] = cand;
-                        tb_step[ns] = state as u8;
-                    }
-                }
+        // Pre-roll: feed the last EXTRA input bits to warm up the
+        // trellis, then the main frame_len bits, then post-roll EXTRA
+        // wrapped from the start. Total iterations = len + 64.
+        let mut j = frame_len - EXTRA;
+        for i in 0..total {
+            if j == frame_len {
+                j = 0;
             }
-
-            pm = new_pm;
-            self.traceback.push(tb_step);
+            self.step(depunctured, j, i);
+            j += 1;
         }
 
-        self.path_metrics = pm;
+        // Find best terminal state.
+        let mut s = self.best_state();
 
-        // Traceback: find best final state, then trace back through steps
-        let best_end = self.path_metrics.iter().enumerate()
-            .max_by_key(|&(_, &v)| v)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
-        let mut state = best_end as u8;
-        let mut inputs = vec![0u8; steps];
-
-        for step in (0..steps).rev() {
-            let prev_state = self.traceback[step][state as usize];
-
-            // Extract the 5 input bits that caused transition prev_state -> state
-            inputs[step] = find_input(prev_state as usize, state as usize);
-            state = prev_state;
+        // Walk back through the post-roll EXTRA paths to recover the
+        // state at the end of the main frame (step EXTRA + frame_len - 1).
+        for i in ((EXTRA + frame_len)..total).rev() {
+            let path = self.traceback[i][s];
+            s = ((s & 0x1f) << 1) | (path as usize);
         }
 
-        let byte_len = (steps * 5).div_ceil(8);
-        let mut decoded = vec![0u8; byte_len];
-        let mut bit_pos = 0;
-        for inp in inputs {
-            for b in (0..5).rev() {
-                if (inp >> b) & 1 == 1 {
-                    let byte_idx = bit_pos / 8;
-                    let bit_off = bit_pos % 8;
-                    decoded[byte_idx] |= 1 << (7 - bit_off);
-                }
-                bit_pos += 1;
-            }
-        }
-        self.out_buf = decoded;
-        &self.out_buf
-    }
-}
-
-fn find_input(prev_state: usize, next_state: usize) -> u8 {
-    let nxt_tab = &*NXT_TABLE;
-    for inp in 0..VITERBI_INPUTS {
-        if nxt_tab[prev_state][inp] as usize == next_state {
-            return inp as u8;
+        // Main traceback over the frame_len paths, skipping the
+        // pre-roll EXTRA at the head of the paths array.
+        for t in (0..frame_len).rev() {
+            decoded[t] = (s >> 5) as u8;
+            let path = self.traceback[EXTRA + t][s];
+            s = ((s & 0x1f) << 1) | (path as usize);
         }
     }
-    0
+
+    fn best_state(&self) -> usize {
+        let mut max = i32::MIN;
+        let mut best = 0;
+        for (i, &m) in self.metrics.iter().enumerate() {
+            if m > max {
+                max = m;
+                best = i;
+            }
+        }
+        best
+    }
+
+    /// Process input position `j` (3 soft bits at j*3..j*3+3) and
+    /// store the path decisions at traceback index `store_idx`.
+    #[inline(always)]
+    fn step(&mut self, soft: &[i8], j: usize, store_idx: usize) {
+        let r0 = soft[j * 3] as i32;
+        let r1 = soft[j * 3 + 1] as i32;
+        let r2 = soft[j * 3 + 2] as i32;
+
+        let mut new_tb = [0u8; STATES];
+
+        // Match conv_dec.c's gen_state_info(): the branch output for
+        // butterfly state s is computed from the previous register after
+        // vstate_lshift(s, k, 0), plus the bit that wraps from s bit 5
+        // into generator bit 6.
+        for s in 0..HALF {
+            let history = ((s << 1) & 0x3e) | ((s >> 5) << 6);
+            let p0 = (history & CONV_K7_GEN[0] as usize).count_ones() & 1;
+            let p1 = (history & CONV_K7_GEN[1] as usize).count_ones() & 1;
+            let p2 = (history & CONV_K7_GEN[2] as usize).count_ones() & 1;
+
+            let m0 = if p0 == 0 { -r0 } else { r0 };
+            let m1 = if p1 == 0 { -r1 } else { r1 };
+            let m2 = if p2 == 0 { -r2 } else { r2 };
+            let metric = m0 + m1 + m2;
+
+            let sum_a = self.metrics[2 * s];
+            let sum_b = self.metrics[2 * s + 1];
+
+            // next_state = s (new_bit = 0)
+            let cand0 = sum_a + metric;
+            let cand1 = sum_b - metric;
+            if cand0 > cand1 {
+                self.new_metrics[s] = cand0;
+                new_tb[s] = 0;
+            } else {
+                self.new_metrics[s] = cand1;
+                new_tb[s] = 1;
+            }
+
+            // next_state = s + 32 (new_bit = 1)
+            let cand2 = sum_a - metric;
+            let cand3 = sum_b + metric;
+            if cand2 > cand3 {
+                self.new_metrics[s + HALF] = cand2;
+                new_tb[s + HALF] = 0;
+            } else {
+                self.new_metrics[s + HALF] = cand3;
+                new_tb[s + HALF] = 1;
+            }
+        }
+
+        self.metrics.copy_from_slice(&self.new_metrics);
+        self.traceback[store_idx] = new_tb;
+    }
 }
 
 impl Default for Viterbi {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
