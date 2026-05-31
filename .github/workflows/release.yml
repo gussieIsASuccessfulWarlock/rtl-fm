@@ -1,0 +1,46 @@
+name: Release
+
+# Build the release binary and publish a GitHub Release whenever a
+# version tag is pushed (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Needed so the workflow can create the release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          tar -czf "dist/rtl-fm-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" \
+            -C target/release rtl-fm
+          cp target/release/rtl-fm "dist/rtl-fm-${GITHUB_REF_NAME}-x86_64-linux"
+          cp udev/99-rtl-sdr.rules dist/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

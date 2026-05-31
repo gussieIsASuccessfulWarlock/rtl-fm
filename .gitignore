@@ -1,5 +1,12 @@
+# Local builds and release packaging
 /target
+/dist
 Cargo.lock
+
+# Runtime captures and outputs the binary writes to the working directory
 *.iq
 *.wav
 *.flac
+*.cu8
+album_art_*
+error.log
